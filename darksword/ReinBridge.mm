@@ -42,6 +42,77 @@ static std::atomic<double> g_progress(0.0);
 static RemoteCall *g_springBoard = nil;
 
 // ---------------------------------------------------------------------------
+// In-app console log ring buffer（内核页「控制台日志」查看器的数据源）
+// ReinBridge / PeaceESP 的日志在写 os_log 的同时镜像到这里。
+// ---------------------------------------------------------------------------
+
+static NSUInteger const kReinConsoleLogHardCap = 1500; // 环形缓冲上限
+static NSMutableArray<NSString *> *gConsoleLog = nil;
+
+static NSObject *rein_console_lock(void) {
+    static NSObject *lock;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ lock = [NSObject new]; });
+    return lock;
+}
+
+static NSDateFormatter *rein_console_date_formatter(void) {
+    static NSDateFormatter *formatter;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        formatter = [[NSDateFormatter alloc] init];
+        formatter.dateFormat = @"HH:mm:ss.SSS";
+        formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    });
+    return formatter;
+}
+
+void ReinAppendConsoleLog(NSString *line) {
+    if (line.length == 0) return;
+    @synchronized (rein_console_lock()) {
+        if (!gConsoleLog) gConsoleLog = [NSMutableArray array];
+        [gConsoleLog addObject:[NSString stringWithFormat:@"%@  %@",
+            [rein_console_date_formatter() stringFromDate:[NSDate date]], line]];
+        if (gConsoleLog.count > kReinConsoleLogHardCap) {
+            [gConsoleLog removeObjectsInRange:
+                NSMakeRange(0, gConsoleLog.count - kReinConsoleLogHardCap)];
+        }
+    }
+}
+
+NSArray<NSString *> *ReinConsoleLogLines(void) {
+    @synchronized (rein_console_lock()) {
+        return gConsoleLog ? [gConsoleLog copy] : @[];
+    }
+}
+
+void ReinClearConsoleLog(void) {
+    @synchronized (rein_console_lock()) {
+        if (gConsoleLog) [gConsoleLog removeAllObjects];
+    }
+}
+
+// 内部日志宏：os_log（Console.app 可见）+ 内存镜像（App 内查看器可见）
+// %{public} 仅供 os_log 使用，镜像前剔除以保证 NSString 格式化安全。
+static NSString *rein_console_fmt(NSString *fmt) {
+    return [fmt stringByReplacingOccurrencesOfString:@"%{public}" withString:@""];
+}
+
+#define RB_LOG(fmt, ...) \
+    do { \
+        os_log(OS_LOG_DEFAULT, "[ReinBridge] " fmt, ##__VA_ARGS__); \
+        ReinAppendConsoleLog([NSString \
+            stringWithFormat:rein_console_fmt(@"[ReinBridge] " fmt), ##__VA_ARGS__]); \
+    } while (0)
+
+#define RB_LOG_ERROR(fmt, ...) \
+    do { \
+        os_log_error(OS_LOG_DEFAULT, "[ReinBridge] " fmt, ##__VA_ARGS__); \
+        ReinAppendConsoleLog([NSString \
+            stringWithFormat:rein_console_fmt(@"[ReinBridge] " fmt), ##__VA_ARGS__]); \
+    } while (0)
+
+// ---------------------------------------------------------------------------
 // kernelcache prefetch (ported from DarkSpeed's DSBridge)
 // ---------------------------------------------------------------------------
 
@@ -65,7 +136,7 @@ static void rein_set_stage(NSString *stage) {
     os_unfair_lock_lock(&g_stateLock);
     g_stage = [stage copy] ?: @"";
     os_unfair_lock_unlock(&g_stateLock);
-    os_log(OS_LOG_DEFAULT, "[ReinBridge] stage: %{public}@", g_stage);
+    RB_LOG("stage: %{public}@", g_stage);
 }
 
 static void rein_set_error(NSString *message) {
@@ -73,7 +144,7 @@ static void rein_set_error(NSString *message) {
     g_lastError = [message copy] ?: @"";
     os_unfair_lock_unlock(&g_stateLock);
     if (g_lastError.length > 0) {
-        os_log_error(OS_LOG_DEFAULT, "[ReinBridge] %{public}@", g_lastError);
+        RB_LOG_ERROR("%{public}@", g_lastError);
     }
 }
 
@@ -86,7 +157,7 @@ static void rein_post_progress(void) {
 
 static void rein_bridge_log(const char *message) {
     if (message && message[0]) {
-        os_log(OS_LOG_DEFAULT, "[ReinBridge] %{public}s", message);
+        RB_LOG("%{public}s", message);
     }
 }
 
@@ -146,12 +217,12 @@ static void rein_start_kernel_prefetch(BOOL retryFailed) {
         BOOL ready = dlkcache();
         g_kernelPrefetchState.store(ready ? 2 : 3);
         if (ready) {
-            os_log(OS_LOG_DEFAULT, "[ReinBridge] kernelcache prefetch ready");
+            RB_LOG("kernelcache prefetch ready");
             rein_mark_network_warmup_ready();
             rein_set_error(@"");
             rein_set_stage(@"内核缓存完成");
         } else {
-            os_log_error(OS_LOG_DEFAULT, "[ReinBridge] kernelcache prefetch failed");
+            RB_LOG_ERROR("kernelcache prefetch failed");
             if (g_networkWarmupState.load() == 1) {
                 rein_set_stage(@"正在请求网络权限");
             } else {
@@ -172,7 +243,7 @@ static BOOL rein_wait_for_kernel_attempt(CFAbsoluteTime deadline) {
         rein_kernel_prefetch_group(),
         dispatch_time(DISPATCH_TIME_NOW, (int64_t)(remaining * NSEC_PER_SEC)));
     if (waitResult != 0) {
-        os_log_error(OS_LOG_DEFAULT, "[ReinBridge] kernelcache prefetch timed out");
+        RB_LOG_ERROR("kernelcache prefetch timed out");
         return NO;
     }
     return rein_has_symbol_offsets();
@@ -198,7 +269,7 @@ static void rein_probe_network_until_ready(CFAbsoluteTime startedAt, NSUInteger 
                 (httpResponse.statusCode >= 200 && httpResponse.statusCode < 400);
             if (!error && response && httpOK) {
                 if (!rein_mark_network_warmup_ready()) return;
-                os_log(OS_LOG_DEFAULT, "[ReinBridge] network access ready after %.0fs",
+                RB_LOG("network access ready after %.0fs",
                        CFAbsoluteTimeGetCurrent() - startedAt);
                 rein_set_error(@"");
                 rein_set_stage(@"网络已连接，正在准备内核缓存");
@@ -216,8 +287,7 @@ static void rein_probe_network_until_ready(CFAbsoluteTime startedAt, NSUInteger 
                     detail = [NSString stringWithFormat:@"HTTP %ld", (long)httpResponse.statusCode];
                 }
                 if (!detail.length) detail = @"无有效响应";
-                os_log_error(OS_LOG_DEFAULT,
-                             "[ReinBridge] network warm-up timed out: %{public}@", detail);
+                RB_LOG_ERROR("network warm-up timed out: %{public}@", detail);
                 rein_set_stage(@"等待网络超时");
                 rein_set_error([NSString stringWithFormat:
                     @"等待 %.0f 秒后仍无法连接：%@\n请检查网络权限与连接后重试。", totalElapsed, detail]);
@@ -284,7 +354,7 @@ static BOOL rein_wait_for_kernel_prefetch(NSTimeInterval timeout, BOOL retryFail
             rein_network_warmup_group(),
             dispatch_time(DISPATCH_TIME_NOW, (int64_t)(remaining * NSEC_PER_SEC)));
         if (networkWaitResult != 0) {
-            os_log_error(OS_LOG_DEFAULT, "[ReinBridge] network warm-up timed out");
+            RB_LOG_ERROR("network warm-up timed out");
             return NO;
         }
     }
@@ -304,7 +374,7 @@ static BOOL rein_bootstrap_kernel(void) {
 
     ds_set_log_callback(rein_bridge_log);
     ds_set_progress_callback(rein_bridge_progress);
-    os_log(OS_LOG_DEFAULT, "[ReinBridge] running DarkSword chain off-main-thread");
+    RB_LOG("running DarkSword chain off-main-thread");
 
     // offsets_init() must run BEFORE ds_run() — pe_v1() needs the socket/inpcb
     // offsets to find the corrupted socket.
@@ -322,7 +392,7 @@ static BOOL rein_bootstrap_kernel(void) {
     g_kernelReady.store(true);
     rein_set_stage(@"DarkSword 初始化完成");
     rein_set_error(@"");
-    os_log(OS_LOG_DEFAULT, "[ReinBridge] DarkSword ready");
+    RB_LOG("DarkSword ready");
     return YES;
 }
 
@@ -428,8 +498,7 @@ void ReinInitializeRemoteCall(void) {
                     return;
                 }
 
-                os_log(OS_LOG_DEFAULT,
-                       "[ReinBridge] SpringBoard proc=0x%llx self=0x%llx — starting RemoteCall",
+                RB_LOG("SpringBoard proc=0x%llx self=0x%llx — starting RemoteCall",
                        (unsigned long long)sbProc, (unsigned long long)ds_get_our_proc());
 
                 rein_set_stage(@"正在连接 SpringBoard");
@@ -455,7 +524,7 @@ void ReinInitializeRemoteCall(void) {
                 rein_set_stage(@"RemoteCall 已连接");
                 rein_set_error(@"");
                 rein_post_progress();
-                os_log(OS_LOG_DEFAULT, "[ReinBridge] RemoteCall active (SpringBoard pid=%d)", process.pid);
+                RB_LOG("RemoteCall active (SpringBoard pid=%d)", process.pid);
             } @catch (NSException *exception) {
                 g_springBoard = nil;
                 g_remoteReady.store(false);

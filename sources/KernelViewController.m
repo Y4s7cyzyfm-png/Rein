@@ -8,6 +8,199 @@
 #import "MD3Components.h"
 #import "ReinBridge.h"
 
+#pragma mark - Console log viewer（内核页「控制台日志」实时查看器）
+
+@interface ConsoleLogViewController ()
+@property (nonatomic, strong) UITextView *textView;
+@property (nonatomic, strong) UILabel *countLabel;
+@property (nonatomic, strong) UIButton *copyButton;
+@property (nonatomic, strong) UIButton *clearButton;
+@property (nonatomic, copy) NSString *lastRenderedText;
+@property (nonatomic, strong) NSTimer *refreshTimer;
+@end
+
+@implementation ConsoleLogViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = MD3Theme.backgroundColor;
+
+    UIView *header = [[UIView alloc] init];
+    header.backgroundColor = MD3Theme.surfaceColor;
+    header.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:header];
+
+    UILabel *titleLabel = [[UILabel alloc] init];
+    titleLabel.text = @"控制台日志";
+    titleLabel.font = MD3Theme.titleFont;
+    titleLabel.textColor = MD3Theme.onSurfaceColor;
+    titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [header addSubview:titleLabel];
+
+    self.countLabel = [[UILabel alloc] init];
+    self.countLabel.font = MD3Theme.labelFont;
+    self.countLabel.textColor = MD3Theme.onSurfaceVariantColor;
+    self.countLabel.text = @"0 行";
+    self.countLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [header addSubview:self.countLabel];
+
+    self.copyButton = [self headerButtonWithTitle:@"复制"];
+    self.clearButton = [self headerButtonWithTitle:@"清空"];
+    UIButton *doneButton = [self headerButtonWithTitle:@"完成"];
+    [header addSubview:self.copyButton];
+    [header addSubview:self.clearButton];
+    [header addSubview:doneButton];
+
+    self.textView = [[UITextView alloc] init];
+    self.textView.editable = NO;
+    self.textView.selectable = YES;
+    self.textView.alwaysBounceVertical = YES;
+    self.textView.backgroundColor = [UIColor colorWithWhite:0.04 alpha:1.0];
+    self.textView.textColor = [UIColor colorWithRed:0.55 green:0.88 blue:0.62 alpha:1.0];
+    self.textView.font = ([UIFont fontWithName:@"Menlo-Regular" size:11]
+                          ?: [UIFont monospaceSystemFontOfSize:11 weight:UIFontWeightRegular]);
+    self.textView.layer.cornerRadius = 12;
+    self.textView.layer.masksToBounds = YES;
+    self.textView.contentInset = UIEdgeInsetsMake(10, 6, 10, 6);
+    self.textView.layoutManager.allowsNonContiguousLayout = NO;
+    self.textView.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:self.textView];
+
+    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [header.topAnchor constraintEqualToAnchor:safe.topAnchor],
+        [header.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [header.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [header.heightAnchor constraintEqualToConstant:64],
+
+        [titleLabel.topAnchor constraintEqualToAnchor:header.topAnchor constant:10],
+        [titleLabel.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:16],
+
+        [self.countLabel.topAnchor constraintEqualToAnchor:titleLabel.bottomAnchor constant:2],
+        [self.countLabel.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:16],
+        [self.countLabel.bottomAnchor constraintLessThanOrEqualToAnchor:header.bottomAnchor constant:-8],
+
+        [doneButton.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-16],
+        [doneButton.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
+
+        [self.clearButton.trailingAnchor constraintEqualToAnchor:doneButton.leadingAnchor constant:-18],
+        [self.clearButton.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
+
+        [self.copyButton.trailingAnchor constraintEqualToAnchor:self.clearButton.leadingAnchor constant:-18],
+        [self.copyButton.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
+
+        [self.textView.topAnchor constraintEqualToAnchor:header.bottomAnchor constant:10],
+        [self.textView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:12],
+        [self.textView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-12],
+        [self.textView.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-10],
+    ]];
+
+    [doneButton addTarget:self action:@selector(doneTapped)
+         forControlEvents:UIControlEventTouchUpInside];
+    [self.copyButton addTarget:self action:@selector(copyTapped)
+              forControlEvents:UIControlEventTouchUpInside];
+    [self.clearButton addTarget:self action:@selector(clearTapped)
+               forControlEvents:UIControlEventTouchUpInside];
+
+    [self refreshLog];
+}
+
+- (UIButton *)headerButtonWithTitle:(NSString *)title {
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+    [button setTitle:title forState:UIControlStateNormal];
+    button.titleLabel.font = MD3Theme.labelFont;
+    button.tintColor = MD3Theme.primaryColor;
+    button.translatesAutoresizingMaskIntoConstraints = NO;
+    return button;
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    if (!self.refreshTimer) {
+        self.refreshTimer = [NSTimer timerWithTimeInterval:0.5
+                                                     target:self
+                                                   selector:@selector(refreshLog)
+                                                   userInfo:nil
+                                                    repeats:YES];
+        [[NSRunLoop mainRunLoop] addTimer:self.refreshTimer forMode:NSRunLoopCommonModes];
+    }
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    [self.refreshTimer invalidate];
+    self.refreshTimer = nil;
+}
+
+#pragma mark Actions
+
+- (void)doneTapped {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)copyTapped {
+    NSArray<NSString *> *lines = ReinConsoleLogLines();
+    UIPasteboard.generalPasteboard.string =
+        lines.count > 0 ? [lines componentsJoinedByString:@"\n"] : @"";
+    [self flashButtonTitle:@"已复制"];
+}
+
+- (void)clearTapped {
+    // 两段式确认，防误触
+    if (![self.clearButton.currentTitle isEqualToString:@"确认清空?"]) {
+        [self.clearButton setTitle:@"确认清空?" forState:UIControlStateNormal];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [self.clearButton setTitle:@"清空" forState:UIControlStateNormal];
+        });
+        return;
+    }
+    [self.clearButton setTitle:@"清空" forState:UIControlStateNormal];
+    ReinClearConsoleLog();
+    self.lastRenderedText = nil;
+    [self refreshLog];
+}
+
+- (void)flashButtonTitle:(NSString *)title {
+    [self.copyButton setTitle:title forState:UIControlStateNormal];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [self.copyButton setTitle:@"复制" forState:UIControlStateNormal];
+    });
+}
+
+#pragma mark Refresh
+
+- (void)refreshLog {
+    NSArray<NSString *> *lines = ReinConsoleLogLines();
+    self.countLabel.text = [NSString stringWithFormat:@"%lu 行", (unsigned long)lines.count];
+
+    NSString *text = lines.count > 0
+        ? [lines componentsJoinedByString:@"\n"]
+        : @"（暂无日志——初始化内核或启动 ESP 后，日志会实时显示在这里）";
+    if ([text isEqualToString:self.lastRenderedText]) return;
+
+    BOOL atBottom = [self isTextViewAtBottom];
+    self.textView.text = text;
+    self.lastRenderedText = text;
+    if (atBottom) [self scrollTextViewToBottom]; // 用户在底部时自动跟随新日志
+}
+
+- (BOOL)isTextViewAtBottom {
+    CGFloat overflow = self.textView.contentSize.height - self.textView.bounds.size.height;
+    if (overflow <= 0) return YES;
+    return self.textView.contentOffset.y >= overflow - 60;
+}
+
+- (void)scrollTextViewToBottom {
+    CGFloat overflow = self.textView.contentSize.height - self.textView.bounds.size.height;
+    if (overflow > 0) {
+        [self.textView setContentOffset:CGPointMake(0, overflow) animated:NO];
+    }
+}
+
+@end
+
 @interface KernelViewController ()
 @property (nonatomic, strong) UIScrollView *scrollView;
 @property (nonatomic, strong) UIStackView *stack;
@@ -20,6 +213,7 @@
 
 @property (nonatomic, strong) MD3FilledButton *kernelInitButton;
 @property (nonatomic, strong) MD3FilledButton *remoteCallInitButton;
+@property (nonatomic, strong) MD3FilledButton *consoleLogButton;
 
 @property (nonatomic, strong) UILabel *gameStateLabel;
 @property (nonatomic, strong) MD3FilledButton *readGameButton;
@@ -195,6 +389,11 @@
                                                            style:0];
     [card addSubview:self.remoteCallInitButton];
 
+    self.consoleLogButton = [MD3FilledButton buttonWithTitle:@"控制台日志"
+                                                  systemIcon:@"terminal"
+                                                       style:1];
+    [card addSubview:self.consoleLogButton];
+
     [NSLayoutConstraint activateConstraints:@[
         [cardTitle.topAnchor constraintEqualToAnchor:card.topAnchor constant:16],
         [cardTitle.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
@@ -207,7 +406,11 @@
         [self.remoteCallInitButton.topAnchor constraintEqualToAnchor:self.kernelInitButton.bottomAnchor constant:12],
         [self.remoteCallInitButton.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
         [self.remoteCallInitButton.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
-        [self.remoteCallInitButton.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-16],
+
+        [self.consoleLogButton.topAnchor constraintEqualToAnchor:self.remoteCallInitButton.bottomAnchor constant:12],
+        [self.consoleLogButton.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+        [self.consoleLogButton.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
+        [self.consoleLogButton.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-16],
     ]];
 
     __weak typeof(self) weakSelf = self;
@@ -216,6 +419,9 @@
     };
     self.remoteCallInitButton.onTap = ^(MD3FilledButton *button) {
         [weakSelf remoteCallInitTapped:button];
+    };
+    self.consoleLogButton.onTap = ^(MD3FilledButton *button) {
+        [weakSelf consoleLogTapped:button];
     };
 }
 
@@ -339,6 +545,12 @@
 - (void)dumpSDKTapped:(MD3FilledButton *)sender {
     // 占位：后续接入实际的 UE4 SDK Dump 功能。
     [self showToast:@"Dump UE4 SDK 功能开发中，敬请期待"];
+}
+
+- (void)consoleLogTapped:(MD3FilledButton *)sender {
+    ConsoleLogViewController *viewer = [[ConsoleLogViewController alloc] init];
+    viewer.modalPresentationStyle = UIModalPresentationPageSheet;
+    [self presentViewController:viewer animated:YES completion:nil];
 }
 
 #pragma mark - Toast

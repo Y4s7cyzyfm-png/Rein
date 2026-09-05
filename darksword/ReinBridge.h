@@ -54,4 +54,16 @@ OBJC_EXTERN RemoteCall * _Nullable ReinBridgeRemoteCall(void);
 /// Requires the kernel to be ready. Synchronous (fast). Returns the pid.
 OBJC_EXTERN BOOL ReinReadGameProcess(int * _Nullable outPid);
 
+#pragma mark - In-app console log
+
+/// 追加一行日志到 App 内控制台日志（自动加时间戳，线程安全）。
+/// ReinBridge 与 PeaceESP 的所有日志都会镜像到这里。
+OBJC_EXTERN void ReinAppendConsoleLog(NSString *line);
+
+/// 当前缓存的日志行（旧→新），供「控制台日志」查看器显示。
+OBJC_EXTERN NSArray<NSString *> *ReinConsoleLogLines(void);
+
+/// 清空 App 内控制台日志。
+OBJC_EXTERN void ReinClearConsoleLog(void);
+
 NS_ASSUME_NONNULL_END
