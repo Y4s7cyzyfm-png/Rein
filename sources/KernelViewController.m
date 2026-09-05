@@ -18,8 +18,8 @@
 @property (nonatomic, strong) UILabel *errorLabel;
 @property (nonatomic, strong) MD3ProgressView *progressView;
 
-@property (nonatomic, strong) MD3FilledButton *initKernelButton;
-@property (nonatomic, strong) MD3FilledButton *initRemoteCallButton;
+@property (nonatomic, strong) MD3FilledButton *kernelInitButton;
+@property (nonatomic, strong) MD3FilledButton *remoteCallInitButton;
 @end
 
 @implementation KernelViewController
@@ -173,43 +173,43 @@
     cardTitle.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:cardTitle];
 
-    self.initKernelButton = [MD3FilledButton buttonWithTitle:@"初始化 DarkSword 内核"
+    self.kernelInitButton = [MD3FilledButton buttonWithTitle:@"初始化 DarkSword 内核"
                                                   systemIcon:@"cpu"
                                                        style:0];
-    [card addSubview:self.initKernelButton];
+    [card addSubview:self.kernelInitButton];
 
-    self.initRemoteCallButton = [MD3FilledButton buttonWithTitle:@"初始化 RemoteCall"
+    self.remoteCallInitButton = [MD3FilledButton buttonWithTitle:@"初始化 RemoteCall"
                                                       systemIcon:@"antenna.radiowaves.left.and.right"
                                                            style:0];
-    [card addSubview:self.initRemoteCallButton];
+    [card addSubview:self.remoteCallInitButton];
 
     [NSLayoutConstraint activateConstraints:@[
         [cardTitle.topAnchor constraintEqualToAnchor:card.topAnchor constant:16],
         [cardTitle.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
         [cardTitle.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
 
-        [self.initKernelButton.topAnchor constraintEqualToAnchor:cardTitle.bottomAnchor constant:12],
-        [self.initKernelButton.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
-        [self.initKernelButton.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
+        [self.kernelInitButton.topAnchor constraintEqualToAnchor:cardTitle.bottomAnchor constant:12],
+        [self.kernelInitButton.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+        [self.kernelInitButton.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
 
-        [self.initRemoteCallButton.topAnchor constraintEqualToAnchor:self.initKernelButton.bottomAnchor constant:12],
-        [self.initRemoteCallButton.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
-        [self.initRemoteCallButton.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
-        [self.initRemoteCallButton.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-16],
+        [self.remoteCallInitButton.topAnchor constraintEqualToAnchor:self.kernelInitButton.bottomAnchor constant:12],
+        [self.remoteCallInitButton.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+        [self.remoteCallInitButton.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
+        [self.remoteCallInitButton.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-16],
     ]];
 
     __weak typeof(self) weakSelf = self;
-    self.initKernelButton.onTap = ^(MD3FilledButton *button) {
-        [weakSelf initKernelTapped:button];
+    self.kernelInitButton.onTap = ^(MD3FilledButton *button) {
+        [weakSelf kernelInitTapped:button];
     };
-    self.initRemoteCallButton.onTap = ^(MD3FilledButton *button) {
-        [weakSelf initRemoteCallTapped:button];
+    self.remoteCallInitButton.onTap = ^(MD3FilledButton *button) {
+        [weakSelf remoteCallInitTapped:button];
     };
 }
 
 #pragma mark - Actions
 
-- (void)initKernelTapped:(MD3FilledButton *)sender {
+- (void)kernelInitTapped:(MD3FilledButton *)sender {
     if (ReinKernelIsReady()) {
         [self reloadState];
         return;
@@ -221,7 +221,7 @@
     [self reloadState];
 }
 
-- (void)initRemoteCallTapped:(MD3FilledButton *)sender {
+- (void)remoteCallInitTapped:(MD3FilledButton *)sender {
     if (ReinRemoteCallIsReady()) {
         [self reloadState];
         return;
@@ -288,11 +288,11 @@
     [self.progressView setProgress:kernelRunning ? progress : (kernelReady ? 1.0 : 0.0)
                           animated:YES];
 
-    [self.initKernelButton setEnabled:!kernelRunning];
-    [self.initKernelButton setTitle:(kernelRunning
+    [self.kernelInitButton setEnabled:!kernelRunning];
+    [self.kernelInitButton setTitle:(kernelRunning
                                         ? @"正在初始化内核…"
                                         : (kernelReady ? @"内核已就绪" : @"初始化 DarkSword 内核"))];
-    [self.initRemoteCallButton setEnabled:(kernelReady && !remoteRunning)];
+    [self.remoteCallInitButton setEnabled:(kernelReady && !remoteRunning)];
 }
 
 @end

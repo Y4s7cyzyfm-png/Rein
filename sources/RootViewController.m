@@ -98,7 +98,6 @@
     [tabBar addSubview:indicator];
     self.tabIndicatorView = indicator;
 
-    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
         [tabBar.topAnchor constraintEqualToAnchor:self.appBarView.bottomAnchor],
         [tabBar.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
