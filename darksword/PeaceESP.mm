@@ -497,7 +497,7 @@ enum {
 
     // Actor / Pawn 字段（安卓 SDK 对照表，iOS 同源）
     O_ROOTCOMP  = 0x260,  // 坐标1（RootComponent 指针）
-    O_LOC       = 0x1F0,  // 坐标2：RootComponent 内 vec3（安卓表 0x1f0）
+    O_LOC       = 0x1B0,  // 坐标2：RootComponent 内 vec3（安卓表 0x1f0）
     O_NAME      = 0xAF8,  // 玩家名字（FString）
     O_UID       = 0xB20,  // 玩家 UID
     O_PLAYERDATA= 0x5F0,  // 玩家数据指针
