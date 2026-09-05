@@ -90,7 +90,7 @@ static BOOL SilentKeepAliveConfigureSession(void) {
 // 中断结束（来电/闹钟）或音频服务重置后自动恢复播放
 static void SilentKeepAliveHandleInterruption(NSNotification *notification) {
     BOOL shouldResume = sWantPlaying;
-    NSValue *typeValue = notification.userInfo[AVAudioSessionInterruptionTypeKey];
+    NSNumber *typeValue = notification.userInfo[AVAudioSessionInterruptionTypeKey];
     if (typeValue) {
         AVAudioSessionInterruptionType type =
             (AVAudioSessionInterruptionType)[typeValue unsignedIntegerValue];
