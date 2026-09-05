@@ -79,6 +79,9 @@
     self.kernelStateLabel = [self stateLabelWithIcon:@"cpu"];
     self.remoteStateLabel = [self stateLabelWithIcon:@"antenna.radiowaves.left.and.right"];
     self.stageLabel = [self stateLabelWithIcon:@"circle.dashed"];
+    [card addSubview:self.kernelStateLabel];
+    [card addSubview:self.remoteStateLabel];
+    [card addSubview:self.stageLabel];
 
     self.progressView = [[MD3ProgressView alloc] init];
     self.progressView.translatesAutoresizingMaskIntoConstraints = NO;
