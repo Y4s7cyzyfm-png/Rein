@@ -498,12 +498,12 @@ static bool pe_find_game_base(void)
 {
     // block 按值捕获 C 数组且为只读——用堆缓冲区 + 指针捕获
     typedef struct { uint64_t start, end; } PEMapCand;
-    PEMapCand *cand = (PEMapCand *)calloc(24, sizeof(PEMapCand));
+    PEMapCand *cand = (PEMapCand *)calloc(64, sizeof(PEMapCand));
     if (!cand) return false;
     __block int n = 0;
     vmmapiterateentries(gGameVMMap, ^(uint64_t start, uint64_t end,
                                       uint64_t entry, BOOL *stop) {
-        if (n >= 24) { *stop = YES; return; }
+        if (n >= 64) { *stop = YES; return; }
         if (start < 0x100000000ULL || start >= 0x800000000ULL) return;
         if (end - start < 0x4000ULL) return;
         cand[n].start = start;
@@ -511,30 +511,67 @@ static bool pe_find_game_base(void)
         n++;
     });
     PE_LOG("vm_map 窗口内候选条目 %d 个", n);
+    for (int i = 0; i < n; i++) { // 全量打出布局，便于离线分析偏移
+        PE_LOG("  entry[%d] [0x%llx,0x%llx) size=%lluKB",
+               i, (unsigned long long)cand[i].start,
+               (unsigned long long)cand[i].end,
+               (unsigned long long)((cand[i].end - cand[i].start) >> 10));
+    }
+
+    // 按大小降序验证：主映像（UE4 可执行）通常是最大的 Mach-O 条目，
+    // 且基址 + 偏移必须落在所选条目内——GWorld 全局在映像数据段里。
+    typedef struct { uint64_t size, start, end; } PESorted;
+    PESorted list[64];
+    int m = 0;
+    for (int i = 0; i < n && m < 64; i++) {
+        if (cand[i].end > cand[i].start) {
+            list[m].size = cand[i].end - cand[i].start;
+            list[m].start = cand[i].start;
+            list[m].end = cand[i].end;
+            m++;
+        }
+    }
+    // 插入排序（m ≤ 64，规模小）
+    for (int i = 1; i < m; i++) {
+        PESorted key = list[i];
+        int j = i - 1;
+        while (j >= 0 && list[j].size < key.size) { list[j+1] = list[j]; j--; }
+        list[j+1] = key;
+    }
 
     bool found = false;
-    for (int pass = 0; pass < 2 && !gGameBase; pass++) {
-        uint64_t minSize = (pass == 0) ? 0x1000000ULL : 0x4000ULL;
-        for (int i = 0; i < n; i++) {
-            if (cand[i].end - cand[i].start < minSize) continue;
-            uint32_t magic = 0;
-            if (!kreadbuf(cand[i].start, &magic, sizeof(magic))) continue;
-            if (magic == 0xFEEDFACF || magic == 0xCFFAEDFE) {
-                gGameBase = cand[i].start;
-                PE_LOG("base=0x%llx（条目 #%d 区间 [0x%llx,0x%llx) 首页命中 Mach-O）",
-                       (unsigned long long)gGameBase, i,
-                       (unsigned long long)cand[i].start,
-                       (unsigned long long)cand[i].end);
-                found = true;
-                break;
-            }
+    for (int i = 0; i < m && !found; i++) {
+        uint32_t magic = 0;
+        if (!kreadbuf(list[i].start, &magic, sizeof(magic))) continue;
+        if (magic != 0xFEEDFACF && magic != 0xCFFAEDFE) continue;
+        if (list[i].start + O_GWORLD >= list[i].end) {
+            PE_LOG("entry [0x%llx,0x%llx) 是 Mach-O 但装不下 O_GWORLD=0x%x，跳过",
+                   (unsigned long long)list[i].start,
+                   (unsigned long long)list[i].end, O_GWORLD);
+            continue;
         }
+        gGameBase = list[i].start;
+        PE_LOG("base=0x%llx（entry [0x%llx,0x%llx) size=%lluKB，最大的有效 Mach-O 且容纳 O_GWORLD）",
+               (unsigned long long)gGameBase,
+               (unsigned long long)list[i].start,
+               (unsigned long long)list[i].end,
+               (unsigned long long)(list[i].size >> 10));
+        found = true;
     }
     free(cand);
     if (found) return true;
 
-    PE_LOG_ERROR("窗口内 %d 个条目均未命中 Mach-O 头，请把控制台日志发回分析", n);
-    pe_detail(@"未在游戏 vm_map 条目中找到 Mach-O 主映像（详见控制台日志）");
+    if (gGameBase == 0 && m > 0) {
+        // 有 Mach-O 但都装不下 O_GWORLD：明确告知偏移问题
+        PE_LOG_ERROR("找到 Mach-O 条目但大小均 < O_GWORLD=0x%x（%llu 字节）——"
+                     "O_GWORLD 偏移与当前游戏版本不匹配，需要更新偏移",
+                     O_GWORLD, (unsigned long long)O_GWORLD);
+        pe_detail([NSString stringWithFormat:
+            @"O_GWORLD 偏移 0x%x 超过游戏映像大小，游戏版本偏移需要更新", O_GWORLD]);
+    } else {
+        PE_LOG_ERROR("窗口内 %d 个条目均未命中 Mach-O 头，请把控制台日志发回分析", n);
+        pe_detail(@"未在游戏 vm_map 条目中找到 Mach-O 主映像（详见控制台日志）");
+    }
     return false;
 }
 
