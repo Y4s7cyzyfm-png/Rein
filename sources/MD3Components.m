@@ -272,8 +272,6 @@
     } else {
         changes();
     }
-    self.layer.borderWidth = self.on ? 0 : 2;
-    self.layer.borderColor = MD3Theme.outlineColor.CGColor;
 }
 
 - (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
