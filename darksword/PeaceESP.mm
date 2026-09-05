@@ -567,35 +567,51 @@ static bool pe_find_game_base(void)
         list[j+1] = key;
     }
 
+    // iOS 会把一个映像的各 Mach-O 段拆成多个相邻 vm_map 条目，
+    // 单条目大小不代表映像大小——不再用“条目容纳偏移”做硬性过滤，
+    // 而是直接读 base+O_GWORLD 并校验值本身：
+    //   1) GWorld 是用户态指针（0x1B..0x8B 窗口内）
+    //   2) 自身链第一跳 GWorld+0xC0 也是用户态指针
+    // 页映射对空洞免疫（读不到的页返回 0，且有负缓存），不会误判。
     bool found = false;
     for (int i = 0; i < m && !found; i++) {
         uint32_t magic = 0;
         if (!kreadbuf(list[i].start, &magic, sizeof(magic))) continue;
         if (magic != 0xFEEDFACF && magic != 0xCFFAEDFE) continue;
-        if (list[i].start + O_GWORLD >= list[i].end) {
-            PE_LOG("entry [0x%llx,0x%llx) 是 Mach-O 但装不下 O_GWORLD=0x%x，跳过",
+        uint64_t gwv = kread64(list[i].start + O_GWORLD);
+        if (gwv < 0x100000000ULL || gwv >= 0x800000000ULL) {
+            PE_LOG("entry [0x%llx,0x%llx) 是 Mach-O 但 base+O_GWORLD 处的值 0x%llx 不是有效指针，跳过",
                    (unsigned long long)list[i].start,
-                   (unsigned long long)list[i].end, O_GWORLD);
+                   (unsigned long long)list[i].end,
+                   (unsigned long long)gwv);
+            continue;
+        }
+        uint64_t hop1 = kread64(gwv + O_SELF2);
+        if (hop1 < 0x100000000ULL || hop1 >= 0x800000000ULL) {
+            PE_LOG("entry [0x%llx,0x%llx) 的 GWorld=0x%llx 但 +0x%x 处 0x%llx 不是有效指针，跳过",
+                   (unsigned long long)list[i].start,
+                   (unsigned long long)list[i].end,
+                   (unsigned long long)gwv, O_SELF2, (unsigned long long)hop1);
             continue;
         }
         gGameBase = list[i].start;
-        PE_LOG("base=0x%llx（entry [0x%llx,0x%llx) size=%lluKB，最大的有效 Mach-O 且容纳 O_GWORLD）",
+        PE_LOG("base=0x%llx（entry [0x%llx,0x%llx) size=%lluKB；GWorld=0x%llx +0x%x=0x%llx 双重校验通过）",
                (unsigned long long)gGameBase,
                (unsigned long long)list[i].start,
                (unsigned long long)list[i].end,
-               (unsigned long long)(list[i].size >> 10));
+               (unsigned long long)(list[i].size >> 10),
+               (unsigned long long)gwv, O_SELF2, (unsigned long long)hop1);
         found = true;
     }
     free(cand);
     if (found) return true;
 
-    if (gGameBase == 0 && m > 0) {
-        // 有 Mach-O 但都装不下 O_GWORLD：明确告知偏移问题
-        PE_LOG_ERROR("找到 Mach-O 条目但大小均 < O_GWORLD=0x%x（%llu 字节）——"
-                     "O_GWORLD 偏移与当前游戏版本不匹配，需要更新偏移",
-                     O_GWORLD, (unsigned long long)O_GWORLD);
+    if (m > 0) {
+        PE_LOG_ERROR("所有 Mach-O 条目的 base+O_GWORLD=0x%x 处均无有效 GWorld 指针——"
+                     "偏移可能与游戏版本不匹配（或主映像不在窗口内），请把上方条目布局日志发回分析",
+                     O_GWORLD);
         pe_detail([NSString stringWithFormat:
-            @"O_GWORLD 偏移 0x%x 超过游戏映像大小，游戏版本偏移需要更新", O_GWORLD]);
+            @"base+O_GWORLD（0x%x）处无有效 GWorld 指针，偏移或基址候选有误（详见控制台日志）", O_GWORLD]);
     } else {
         PE_LOG_ERROR("窗口内 %d 个条目均未命中 Mach-O 头，请把控制台日志发回分析", n);
         pe_detail(@"未在游戏 vm_map 条目中找到 Mach-O 主映像（详见控制台日志）");
