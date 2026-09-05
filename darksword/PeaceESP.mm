@@ -31,6 +31,33 @@ extern "C" {
 }
 
 // ============================================================
+// 控制台日志（os_log）
+// Xcode 控制台直接输出；真机用 Console.app / idevicesyslog
+// 过滤 subsystem “com.rein.peaceesp” 即可看到全部 [PE] 日志。
+// ============================================================
+
+static NSString *gLastErrorDetail = @""; // 最近一次初始化失败的具体原因
+
+static os_log_t pe_log_handle(void) {
+    static os_log_t handle;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        handle = os_log_create("com.rein.peaceesp", "esp");
+    });
+    return handle;
+}
+
+#define PE_LOG(fmt, ...)       os_log(pe_log_handle(),      "[PE] " fmt, ##__VA_ARGS__)
+#define PE_LOG_ERROR(fmt, ...) os_log_error(pe_log_handle(), "[PE] " fmt, ##__VA_ARGS__)
+
+/// 记录初始化失败的具体原因（拼进 PeaceESPLastError 的提示，并输出错误级日志）
+static void pe_detail(NSString *detail) {
+    if (detail.length == 0) return;
+    gLastErrorDetail = [detail copy];
+    PE_LOG_ERROR("失败原因：%{public}@", detail);
+}
+
+// ============================================================
 // 配置
 // ============================================================
 
@@ -108,7 +135,7 @@ static void pe_detect_page_size(void)
         else if (ps >= 4096)  gPageShift = 12;
     }
     if (gPageShift == 0) gPageShift = 14; // 默认 16KB
-    printf("[PE] page_size=%d shift=%d\n", 1 << gPageShift, gPageShift);
+    PE_LOG("page_size=%d shift=%d", 1 << gPageShift, gPageShift);
 }
 
 // ---- 解析 ptov_table 符号并缓存映射表 ----
@@ -122,12 +149,16 @@ static bool pe_init_ptov(void)
         NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     NSString *kc = docs.length ? [docs stringByAppendingPathComponent:@"kernelcache"] : nil;
     if (!kc || ![[NSFileManager defaultManager] fileExistsAtPath:kc]) {
-        printf("[PE] kernelcache 不存在，无法解析 ptov_table\n");
+        PE_LOG_ERROR("kernelcache 不存在（path=%{public}@），无法解析 ptov_table", kc);
+        pe_detail(@"Documents 下未找到 kernelcache（请先在「内核」页初始化 DarkSword 内核）");
         return false;
     }
 
     if (xpf_start_with_kernel_path(kc.UTF8String) != 0) {
-        printf("[PE] xpf start 失败: %s\n", xpf_get_error());
+        const char *err = xpf_get_error();
+        PE_LOG_ERROR("xpf start 失败: %{public}s", err ? err : "(null)");
+        pe_detail([NSString stringWithFormat:@"xpf 解析 kernelcache 失败：%s",
+                   err ? err : "unknown"]);
         return false;
     }
     uint64_t sym = xpf_item_resolve("kernelSymbol.ptov_table");
@@ -135,12 +166,16 @@ static bool pe_init_ptov(void)
     xpf_stop();
 
     if (!sym || !fileBase || sym < fileBase) {
-        printf("[PE] ptov_table 符号解析失败（sym=0x%llx fileBase=0x%llx）\n", sym, fileBase);
+        PE_LOG_ERROR("ptov_table 符号解析失败（sym=0x%llx fileBase=0x%llx）",
+                     (unsigned long long)sym, (unsigned long long)fileBase);
+        pe_detail([NSString stringWithFormat:@"ptov_table 符号解析失败（sym=0x%llx fileBase=0x%llx）",
+                   (unsigned long long)sym, (unsigned long long)fileBase]);
         return false;
     }
 
     uint64_t runtime = sym - fileBase + ds_get_kernel_base();
-    printf("[PE] ptov_table: sym=0x%llx runtime=0x%llx\n", sym, runtime);
+    PE_LOG("ptov_table: sym=0x%llx runtime=0x%llx",
+           (unsigned long long)sym, (unsigned long long)runtime);
 
     uint64_t table[PE_PTOV_SIZE];
     memset(table, 0, sizeof(table));
@@ -152,16 +187,19 @@ static bool pe_init_ptov(void)
         if (table[i]) valid++;
     }
     if (valid == 0) {
-        printf("[PE] ptov_table 全零，无法建立 PA→KVA 映射\n");
+        PE_LOG_ERROR("ptov_table 全零（runtime=0x%llx），无法建立 PA→KVA 映射",
+                     (unsigned long long)runtime);
+        pe_detail(@"ptov_table 读取结果全零，无法建立 PA→KVA 映射");
         return false;
     }
 
     gPtovReady = true;
-    printf("[PE] ptov_table 就绪（%d 个映射段）\n", valid);
+    PE_LOG("ptov_table 就绪（%d 个映射段）", valid);
     for (int i = 0; i < PE_PTOV_SIZE; i++) {
         if (gPtovTable[i]) {
-            printf("[PE]   seg[%d] off=0x%llx → VA base=0x%llx\n",
-                   i, gPtovTable[i], gPtovTable[i] + ((uint64_t)i << PE_PTOV_SHIFT));
+            PE_LOG("  seg[%d] off=0x%llx → VA base=0x%llx",
+                   i, (unsigned long long)gPtovTable[i],
+                   (unsigned long long)(gPtovTable[i] + ((uint64_t)i << PE_PTOV_SHIFT)));
         }
     }
     return true;
@@ -171,18 +209,36 @@ static bool pe_init_ptov(void)
 static bool pe_init_game_pmap(void)
 {
     uint64_t proc = procbyname(PE_GAME_PROCESS);
-    if (!proc) { printf("[PE] proc not found\n"); return false; }
+    if (!proc) {
+        PE_LOG_ERROR("procbyname 未找到 %{public}s", PE_GAME_PROCESS);
+        pe_detail(@"procbyname 未找到游戏进程 ShadowTrackerExtra");
+        return false;
+    }
+    PE_LOG("proc=0x%llx", (unsigned long long)proc);
     uint64_t task = proc_task(proc);
-    if (!task) { printf("[PE] task not found\n"); return false; }
+    if (!task) {
+        PE_LOG_ERROR("proc_task 取不到 task（proc=0x%llx）", (unsigned long long)proc);
+        pe_detail([NSString stringWithFormat:@"proc_task 取不到 task（proc=0x%llx）",
+                   (unsigned long long)proc]);
+        return false;
+    }
 
     uint64_t vmmap = 0;
     for (int off = 0x10; off <= 0x40; off += 8) {
         uint64_t val = ds_kread64(task + off);
         if (val > 0xFFFFFFF000000000ULL && val < 0xFFFFFFFFFFFFFFFFULL) {
-            vmmap = val; printf("[PE] vm_map=0x%llx (task+0x%x)\n", vmmap, off); break;
+            vmmap = val;
+            PE_LOG("vm_map=0x%llx (task+0x%x)", (unsigned long long)vmmap, off);
+            break;
         }
     }
-    if (!vmmap) { printf("[PE] vm_map not found\n"); return false; }
+    if (!vmmap) {
+        PE_LOG_ERROR("task+0x10..0x40 未扫描到 vm_map（task=0x%llx）",
+                     (unsigned long long)task);
+        pe_detail([NSString stringWithFormat:@"task+0x10..0x40 未扫描到 vm_map（task=0x%llx）",
+                   (unsigned long long)task]);
+        return false;
+    }
 
     uint64_t pmap = 0;
     for (int off = 0; off < 0x80; off += 8) {
@@ -190,11 +246,19 @@ static bool pe_init_game_pmap(void)
         if (val > 0xFFFFFFF000000000ULL && val < 0xFFFFFFFFFFFFFFFFULL && val != vmmap) {
             uint64_t vfy = ds_kread64(val);
             if (vfy != 0 && vfy != 0xFFFFFFFFFFFFFFFFULL) {
-                pmap = val; printf("[PE] pmap=0x%llx (vmmap+0x%x)\n", pmap, off); break;
+                pmap = val;
+                PE_LOG("pmap=0x%llx (vmmap+0x%x)", (unsigned long long)pmap, off);
+                break;
             }
         }
     }
-    if (!pmap) { printf("[PE] pmap not found\n"); return false; }
+    if (!pmap) {
+        PE_LOG_ERROR("vm_map+0x10..0x78 未扫描到 pmap（vm_map=0x%llx）",
+                     (unsigned long long)vmmap);
+        pe_detail([NSString stringWithFormat:@"vm_map+0x10..0x78 未扫描到 pmap（vm_map=0x%llx）",
+                   (unsigned long long)vmmap]);
+        return false;
+    }
 
     for (int off = 0; off < 0x40; off += 8) {
         uint64_t val = ds_kread64(pmap + off);
@@ -205,12 +269,16 @@ static bool pe_init_game_pmap(void)
             uint64_t l1e = ds_kread64(l1_kva);
             if (l1e != 0 && l1e != 0xFFFFFFFFFFFFFFFFULL) {
                 gGameTTBR0 = val;
-                printf("[PE] TTBR0=0x%llx (pmap+0x%x L1[0]=0x%llx)\n", val, off, l1e);
+                PE_LOG("TTBR0=0x%llx (pmap+0x%x L1[0]=0x%llx)",
+                       (unsigned long long)val, off, (unsigned long long)l1e);
                 return true;
             }
         }
     }
-    printf("[PE] TTBR0 not found\n");
+    PE_LOG_ERROR("pmap+0x10..0x40 未找到有效 TTBR0（pmap=0x%llx）",
+                 (unsigned long long)pmap);
+    pe_detail([NSString stringWithFormat:@"pmap+0x10..0x40 未找到有效 TTBR0（pmap=0x%llx）",
+               (unsigned long long)pmap]);
     return false;
 }
 
@@ -517,8 +585,12 @@ enum {
 static bool pe_init_game(void)
 {
     pe_detect_page_size();
+    PE_LOG("内核基址=0x%llx VM_MIN_KERNEL_ADDRESS=0x%llx VM_MAX_KERNEL_ADDRESS=0x%llx",
+           (unsigned long long)ds_get_kernel_base(),
+           (unsigned long long)VM_MIN_KERNEL_ADDRESS,
+           (unsigned long long)VM_MAX_KERNEL_ADDRESS);
     if (!pe_init_ptov()) {
-        printf("[PE] ptov_table 初始化失败，game init aborted（绝不探测，防内核 panic）\n");
+        PE_LOG_ERROR("ptov_table 初始化失败，game init aborted（绝不探测，防内核 panic）");
         return false;
     }
     if (!pe_init_game_pmap()) return false;
@@ -533,18 +605,24 @@ static bool pe_init_game(void)
                 if (m == 0xFEEDFACF || m == 0xCFFAEDFE) {
                     // 验证：Mach-O magic 落在可执行映像头部
                     gGameBase = probe;
-                    printf("[PE] base=0x%llx iter=%d\n", gGameBase, i);
+                    PE_LOG("base=0x%llx iter=%d", (unsigned long long)gGameBase, i);
                     break;
                 }
             }
         }
         probe += 0x4000;
     }
-    if (!gGameBase) { gGameBase = 0x100000000ULL; printf("[PE] base fallback\n"); }
+    if (!gGameBase) {
+        gGameBase = 0x100000000ULL;
+        PE_LOG_ERROR("基址扫描未命中 Mach-O 头（0x100000000 起 20000 页），回退默认基址 0x100000000，GWorld 读取可能无效");
+    }
     uint64_t gw = kread64(gGameBase + O_GWORLD);
-    printf("[PE] GWorld=0x%llx\n", gw);
+    PE_LOG("GWorld=0x%llx", (unsigned long long)gw);
     gGameOK = (gw > 0x100000000ULL && gw < 0x800000000ULL);
-    if (!gGameOK) printf("[PE] GWorld 不在预期范围，ESP 可能无数据\n");
+    if (!gGameOK) {
+        PE_LOG_ERROR("GWorld=0x%llx 不在预期范围，ESP 可能无数据——游戏版本偏移可能需要更新",
+                     (unsigned long long)gw);
+    }
     return true;
 }
 
@@ -647,7 +725,7 @@ static void pe_overlay_destroy(void) {
 static bool pe_overlay_create(void) {
     CGRect sb = UIScreen.mainScreen.bounds;
     gSW = sb.size.width; gSH = sb.size.height;
-    printf("[PE] screen %.0fx%.0f\n", gSW, gSH);
+    PE_LOG("screen %dx%d", (int)gSW, (int)gSH);
 
     uint64_t windowClass = pe_class("UIWindow");
     uint64_t viewClass = pe_class("UIView");
@@ -658,12 +736,24 @@ static bool pe_overlay_create(void) {
     // HUD 所在窗口挂到 SBMainWorkspace.mainWindowScene（DSBridge 验证过的路径）
     uint64_t workspace = pe_get_main(workspaceClass, "sharedInstance");
     uint64_t scene = workspace ? pe_get_main(workspace, "mainWindowScene") : 0;
-    if (!scene) { printf("[PE] scene nil\n"); return false; }
+    if (!scene) {
+        PE_LOG_ERROR("SBMainWorkspace.mainWindowScene 为 nil");
+        pe_detail(@"SBMainWorkspace.mainWindowScene 为 nil（SpringBoard 场景未就绪）");
+        return false;
+    }
 
     uint64_t alloc = pe_sel("alloc");
     uint64_t window = remote_msg(gRC, windowClass, alloc, 0, 0, 0, 0);
-    if (!window) { printf("[PE] win alloc nil\n"); return false; }
-    if (!pe_call_main_noarg(window, "init")) { printf("[PE] win init fail\n"); return false; }
+    if (!window) {
+        PE_LOG_ERROR("UIWindow alloc 失败");
+        pe_detail(@"远程 UIWindow alloc 失败");
+        return false;
+    }
+    if (!pe_call_main_noarg(window, "init")) {
+        PE_LOG_ERROR("UIWindow init 失败");
+        pe_detail(@"远程 UIWindow init 失败");
+        return false;
+    }
     gOverlayWin = window;
 
     pe_perform_main(window, pe_sel("setWindowScene:"), scene, YES);
@@ -675,7 +765,12 @@ static bool pe_overlay_create(void) {
     uint64_t whiteColor = colorClass ? pe_get_main_retained(colorClass, "whiteColor", NULL, 0) : 0;
     uint64_t greenColor = colorClass ? pe_get_main_retained(colorClass, "greenColor", NULL, 0) : 0;
     uint64_t greenCGColor = greenColor ? pe_get_main(greenColor, "CGColor") : 0;
-    if (!clearColor || !whiteColor) { printf("[PE] colors nil\n"); pe_overlay_destroy(); return false; }
+    if (!clearColor || !whiteColor) {
+        PE_LOG_ERROR("UIColor clearColor/whiteColor 远程获取失败");
+        pe_detail(@"UIColor clearColor/whiteColor 远程获取失败");
+        pe_overlay_destroy();
+        return false;
+    }
 
     pe_perform_main(window, pe_sel("setBackgroundColor:"), clearColor, YES);
     pe_set_rect_main(window, "setFrame:", CGRectMake(0, 0, gSW, gSH));
@@ -739,7 +834,7 @@ static bool pe_overlay_create(void) {
     }
 
     pe_set_u64_main(window, "setHidden:", 0);
-    printf("[PE] overlay %.0fx%.0f %d slots\n", gSW, gSH, PE_MAX_ENEMIES);
+    PE_LOG("overlay %dx%d %d slots", (int)gSW, (int)gSH, PE_MAX_ENEMIES);
     gOverlayReady = true;
     return true;
 }
@@ -820,8 +915,11 @@ static NSString *gLastError = @"";
 static volatile bool gThreadDone = true;
 
 static void pe_fail(NSString *message) {
-    gLastError = [message copy];
-    os_log_error(OS_LOG_DEFAULT, "[PE] %{public}@", message);
+    NSString *full = gLastErrorDetail.length > 0
+        ? [NSString stringWithFormat:@"%@ 原因：%@", message, gLastErrorDetail]
+        : message;
+    gLastError = [full copy];
+    PE_LOG_ERROR("%{public}@", full);
     gThreadDone = true;
 }
 
@@ -832,6 +930,7 @@ void PeaceESPStart(void) {
     if (!gThreadDone) return;
 
     gLastError = @"";
+    gLastErrorDetail = @"";
     gFrames = 0; gVis = 0;
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -846,17 +945,20 @@ void PeaceESPStart(void) {
                 return;
             }
 
-            printf("[PE] === start (4KB/16KB adaptive) ===\n");
-            if (!pe_init_game()) { pe_fail(@"游戏初始化失败（ptov_table / 页表 / 基址扫描），详见控制台日志。"); return; }
+            PE_LOG("=== start (4KB/16KB adaptive) ===（Console.app 过滤 subsystem: com.rein.peaceesp）");
+            if (!pe_init_game()) {
+                pe_fail(@"游戏初始化失败（ptov_table / 页表 / 基址扫描），详细日志见 Console.app（subsystem: com.rein.peaceesp）。");
+                return;
+            }
 
             if (!pe_overlay_create()) {
-                pe_fail(@"SpringBoard Overlay 创建失败。");
+                pe_fail(@"SpringBoard Overlay 创建失败，详细日志见 Console.app（subsystem: com.rein.peaceesp）。");
                 return;
             }
 
             gRun = true;
             gThreadDone = false;
-            os_log(OS_LOG_DEFAULT, "[PE] running");
+            PE_LOG("running");
             while (gRun && gOverlayReady) {
                 @autoreleasepool {
                     peace_esp_tick();
@@ -866,7 +968,7 @@ void PeaceESPStart(void) {
             pe_overlay_destroy();
             gRun = false;
             gThreadDone = true;
-            printf("[PE] loop exit\n");
+            PE_LOG("loop exit");
         }
     });
 }
