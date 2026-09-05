@@ -93,20 +93,29 @@ void ReinClearConsoleLog(void) {
 }
 
 // 内部日志宏：os_log（Console.app 可见）+ 内存镜像（App 内查看器可见）
-// %{public} 仅供 os_log 使用，镜像前剔除以保证 NSString 格式化安全。
+// 镜像前剔除 "{public}"（不带 %——"%{public}@" 剔成字面 "@" 会丢参数，真机已踩坑）。
 static NSString *rein_console_fmt(NSString *fmt) {
-    return [fmt stringByReplacingOccurrencesOfString:@"%{public}" withString:@""];
+    return [fmt stringByReplacingOccurrencesOfString:@"{public}" withString:@""];
 }
 
-// fmt 恒为宏调用处的字面量；stringWithFormat 收到的是 rein_console_fmt()
-// 的返回值（非字面量、无格式化参数），会触发 -Wformat-security，在宏内显式豁免。
+// 统一先把整行渲染成 NSString，再以常量格式 + %s 送 os_log：
+// os_log 对 %@ 支持不可靠，且镜像与 os_log 用同一份渲染结果，杜绝两边不一致。
+static NSString *rein_console_vformat(NSString *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    NSString *out = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    return out;
+}
+
 #define RB_LOG(fmt, ...) \
     do { \
         _Pragma("clang diagnostic push") \
         _Pragma("clang diagnostic ignored \"-Wformat-security\"") \
-        os_log(OS_LOG_DEFAULT, "[ReinBridge] " fmt, ##__VA_ARGS__); \
-        ReinAppendConsoleLog([NSString \
-            stringWithFormat:rein_console_fmt(@"[ReinBridge] " fmt), ##__VA_ARGS__]); \
+        NSString *rb_log_line = \
+            rein_console_vformat(rein_console_fmt(@"[ReinBridge] " fmt), ##__VA_ARGS__); \
+        os_log(OS_LOG_DEFAULT, "[ReinBridge] %{public}s", rb_log_line.UTF8String ?: "(null)"); \
+        ReinAppendConsoleLog(rb_log_line); \
         _Pragma("clang diagnostic pop") \
     } while (0)
 
@@ -114,9 +123,10 @@ static NSString *rein_console_fmt(NSString *fmt) {
     do { \
         _Pragma("clang diagnostic push") \
         _Pragma("clang diagnostic ignored \"-Wformat-security\"") \
-        os_log_error(OS_LOG_DEFAULT, "[ReinBridge] " fmt, ##__VA_ARGS__); \
-        ReinAppendConsoleLog([NSString \
-            stringWithFormat:rein_console_fmt(@"[ReinBridge] " fmt), ##__VA_ARGS__]); \
+        NSString *rb_log_line = \
+            rein_console_vformat(rein_console_fmt(@"[ReinBridge] " fmt), ##__VA_ARGS__); \
+        os_log_error(OS_LOG_DEFAULT, "[ReinBridge] %{public}s", rb_log_line.UTF8String ?: "(null)"); \
+        ReinAppendConsoleLog(rb_log_line); \
         _Pragma("clang diagnostic pop") \
     } while (0)
 

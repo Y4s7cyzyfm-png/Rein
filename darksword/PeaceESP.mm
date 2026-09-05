@@ -47,21 +47,30 @@ static os_log_t pe_log_handle(void) {
     return handle;
 }
 
-// %{public} 仅供 os_log 使用，镜像前剔除以保证 NSString 格式化安全
+// os_log 隐私标记仅 %{public}s/{public} 形式；镜像前剔除 "{public}"（不带 %，
+// 否则 "%{public}@" 会变成字面 "@"，参数被丢弃——真机已踩坑）
 static NSString *pe_console_fmt(NSString *fmt) {
-    return [fmt stringByReplacingOccurrencesOfString:@"%{public}" withString:@""];
+    return [fmt stringByReplacingOccurrencesOfString:@"{public}" withString:@""];
 }
 
-// PE_LOG：os_log（Console.app 可见）+ 镜像到 ReinBridge 内存日志（App 内查看器可见）
-// fmt 恒为宏调用处的字面量；stringWithFormat 收到的是 pe_console_fmt()
-// 的返回值（非字面量、无格式化参数），会触发 -Wformat-security，在宏内显式豁免。
+// 统一先把整行渲染成 NSString，再以常量格式 + %s 送 os_log：
+// os_log 对 %@ 支持不可靠，且镜像与 os_log 用同一份渲染结果，杜绝两边不一致。
+static NSString *pe_console_vformat(NSString *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    NSString *out = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    return out;
+}
+
 #define PE_LOG(fmt, ...) \
     do { \
         _Pragma("clang diagnostic push") \
         _Pragma("clang diagnostic ignored \"-Wformat-security\"") \
-        os_log(pe_log_handle(), "[PE] " fmt, ##__VA_ARGS__); \
-        ReinAppendConsoleLog([NSString \
-            stringWithFormat:pe_console_fmt(@"[PE] " fmt), ##__VA_ARGS__]); \
+        NSString *pe_log_line = \
+            pe_console_vformat(pe_console_fmt(@"[PE] " fmt), ##__VA_ARGS__); \
+        os_log(pe_log_handle(), "[PE] %{public}s", pe_log_line.UTF8String ?: "(null)"); \
+        ReinAppendConsoleLog(pe_log_line); \
         _Pragma("clang diagnostic pop") \
     } while (0)
 
@@ -69,9 +78,10 @@ static NSString *pe_console_fmt(NSString *fmt) {
     do { \
         _Pragma("clang diagnostic push") \
         _Pragma("clang diagnostic ignored \"-Wformat-security\"") \
-        os_log_error(pe_log_handle(), "[PE] " fmt, ##__VA_ARGS__); \
-        ReinAppendConsoleLog([NSString \
-            stringWithFormat:pe_console_fmt(@"[PE] " fmt), ##__VA_ARGS__]); \
+        NSString *pe_log_line = \
+            pe_console_vformat(pe_console_fmt(@"[PE] " fmt), ##__VA_ARGS__); \
+        os_log_error(pe_log_handle(), "[PE] %{public}s", pe_log_line.UTF8String ?: "(null)"); \
+        ReinAppendConsoleLog(pe_log_line); \
         _Pragma("clang diagnostic pop") \
     } while (0)
 
@@ -129,17 +139,21 @@ static PE_Vec3  gMyPos = {0};
 // 内核内存读取基础设施（ptov_table + 页表）
 // ============================================================
 
-static uint64_t gGameTTBR0 = 0;          // 游戏进程页表基址（PA）
+static uint64_t gGameTTBR0 = 0;          // 游戏进程页表基址（PA，即 pmap->ttep）
+static uint64_t gGameL1KVA = 0;          // 游戏 L1 页表内核虚地址（即 pmap->tte）
 static int      gPageShift = 0;          // 12=4KB, 14=16KB
 static uint64_t gPtovTable[PE_PTOV_SIZE]; // XNU ptov_table 缓存
 static bool     gPtovReady = false;
+static int      gPtovShift = 0;          // 已验证的 ptov 索引位移（0=未验证，回退标准 36）
+static int      gPtovIdxAdd = 0;         // 已验证的索引附加值（+1 = 表基址偏 8 字节）
 
-// ---- PA → KVA：只经内核官方 ptov_table 换算，无映射即失败 ----
+// ---- 按指定公式做 PA → KVA（只经 ptov_table 换算，无映射即失败） ----
 // 绝不探测任意内核地址：ds_kread 对非法 KVA 会触发
 // copy_validate_kernel_addr 内核 panic（真机已验证）。
-static uint64_t pe_pa_to_kva(uint64_t pa) {
+static uint64_t pe_ptov_kva_raw(uint64_t pa, int shift, int idxAdd) {
     if (!gPtovReady) return 0;
-    uint64_t idx = (pa >> PE_PTOV_SHIFT) & (PE_PTOV_SIZE - 1);
+    uint64_t idx = ((pa >> shift) & (PE_PTOV_SIZE - 1)) + (uint64_t)idxAdd;
+    if (idx >= PE_PTOV_SIZE) return 0;
     uint64_t off = gPtovTable[idx];
     if (!off) return 0; // 该物理段无 physmap 映射
     uint64_t kva = off + pa;
@@ -148,6 +162,11 @@ static uint64_t pe_pa_to_kva(uint64_t pa) {
     if (VM_MIN_KERNEL_ADDRESS != 0 && kva < VM_MIN_KERNEL_ADDRESS) return 0;
     if (VM_MAX_KERNEL_ADDRESS != 0 && kva > VM_MAX_KERNEL_ADDRESS) return 0;
     return kva;
+}
+
+static uint64_t pe_pa_to_kva(uint64_t pa) {
+    if (gPtovShift != 0) return pe_ptov_kva_raw(pa, gPtovShift, gPtovIdxAdd);
+    return pe_ptov_kva_raw(pa, PE_PTOV_SHIFT, 0);
 }
 
 // ---- 检测页大小 ----
@@ -248,69 +267,129 @@ static bool pe_init_game_pmap(void)
         return false;
     }
 
-    uint64_t vmmap = 0;
-    for (int off = 0x10; off <= 0x40; off += 8) {
-        uint64_t val = ds_kread64(task + off);
-        if (val > 0xFFFFFFF000000000ULL && val < 0xFFFFFFFFFFFFFFFFULL) {
-            vmmap = val;
-            PE_LOG("vm_map=0x%llx (task+0x%x)", (unsigned long long)vmmap, off);
-            break;
-        }
-    }
-    if (!vmmap) {
-        PE_LOG_ERROR("task+0x10..0x40 未扫描到 vm_map（task=0x%llx）",
-                     (unsigned long long)task);
-        pe_detail([NSString stringWithFormat:@"task+0x10..0x40 未扫描到 vm_map（task=0x%llx）",
+    // vm_map：直接用 DarkSword offsets（off_task_map，随内核版本解析），
+    // 比按指针范围扫描可靠——本机内核堆指针为 0xffffffe0-0xffffffe7 段，
+    // 旧的 >0xFFFFFFF0 判定会全部漏掉（真机日志已证实）
+    uint64_t vmmap = task_get_vm_map(task);
+    if (!ds_isvalid(vmmap)) {
+        PE_LOG_ERROR("task_get_vm_map 取不到 vm_map（task=0x%llx off_task_map=0x%x）",
+                     (unsigned long long)task, off_task_map);
+        pe_detail([NSString stringWithFormat:@"task_get_vm_map 取不到 vm_map（task=0x%llx）",
                    (unsigned long long)task]);
         return false;
     }
+    PE_LOG("vm_map=0x%llx (off_task_map=0x%x)", (unsigned long long)vmmap, off_task_map);
 
-    uint64_t pmap = 0;
-    for (int off = 0; off < 0x80; off += 8) {
-        uint64_t val = ds_kread64(vmmap + off);
-        if (val > 0xFFFFFFF000000000ULL && val < 0xFFFFFFFFFFFFFFFFULL && val != vmmap) {
-            uint64_t vfy = ds_kread64(val);
-            if (vfy != 0 && vfy != 0xFFFFFFFFFFFFFFFFULL) {
-                pmap = val;
-                PE_LOG("pmap=0x%llx (vmmap+0x%x)", (unsigned long long)pmap, off);
-                break;
-            }
+    // pmap 候选：vm_map 前部字段里的内核指针（去重，最多 4 个）
+    uint64_t pmapCand[4];
+    int nMap = 0;
+    for (int off = 0x10; off <= 0x70 && nMap < 4; off += 8) {
+        uint64_t val = ds_kreadptr(vmmap + off);
+        if (ds_isvalid(val) && val != vmmap) {
+            bool dup = false;
+            for (int i = 0; i < nMap; i++) if (pmapCand[i] == val) dup = true;
+            if (!dup) pmapCand[nMap++] = val;
         }
     }
-    if (!pmap) {
-        PE_LOG_ERROR("vm_map+0x10..0x78 未扫描到 pmap（vm_map=0x%llx）",
+    if (nMap == 0) {
+        PE_LOG_ERROR("vm_map+0x10..0x70 未扫描到 pmap 候选（vm_map=0x%llx）",
                      (unsigned long long)vmmap);
-        pe_detail([NSString stringWithFormat:@"vm_map+0x10..0x78 未扫描到 pmap（vm_map=0x%llx）",
+        pe_detail([NSString stringWithFormat:@"vm_map+0x10..0x70 未扫描到 pmap 候选（vm_map=0x%llx）",
                    (unsigned long long)vmmap]);
         return false;
     }
 
-    for (int off = 0; off < 0x40; off += 8) {
-        uint64_t val = ds_kread64(pmap + off);
-        if (val > 0x100000000ULL && val < 0x1000000000ULL && (val & 0xFFF) == 0) {
-            // 候选 TTBR0（PA）：经 ptov_table 安全换算后再验证
-            uint64_t l1_kva = pe_pa_to_kva(val);
-            if (!l1_kva) continue;
-            uint64_t l1e = ds_kread64(l1_kva);
-            if (l1e != 0 && l1e != 0xFFFFFFFFFFFFFFFFULL) {
-                gGameTTBR0 = val;
-                PE_LOG("TTBR0=0x%llx (pmap+0x%x L1[0]=0x%llx)",
-                       (unsigned long long)val, off, (unsigned long long)l1e);
-                return true;
+    // iOS 18 的 ptov_table 条目语义与经典 (pa>>36)+delta 存在差异（实测
+    // seg[0] 基址不是内核 VA）。这里用 pmap 里的 (ttep PA, tte KVA) 对现场
+    // 验证公式：正确公式满足 ptov(ttep) == tte，且 tte 指向的 L1[0] 是有效
+    // 描述符（游戏用户空间 VA 全部落在 L1[0] 覆盖范围内）。读取仅触及
+    // 结构体内真实指针，不做任意地址探测，防内核 panic。
+    static const struct { int shift; int add; } kPtovFormulas[] = {
+        {36, 0},  // 经典 XNU：phystokv(pa) = ptov[pa>>36] + pa
+        {36, 1},  // 符号偏 8 字节（表前多算一条）
+        {35, 0},  // 位移 35
+        {34, 0},  // 位移 34
+        {33, 0},  // 位移 33
+    };
+    const size_t kNumFormulas = sizeof(kPtovFormulas) / sizeof(kPtovFormulas[0]);
+    uint64_t pageMask = (1ULL << (gPageShift ? gPageShift : 14)) - 1;
+
+    for (int m = 0; m < nMap; m++) {
+        uint64_t pmap = pmapCand[m];
+
+        // ttep 候选（PA）：32 位视图按 ppnum 展开（<<12/<<14）+ 64 位视图原值
+        uint64_t paCand[24];
+        int nPa = 0;
+        // tte 候选（内核 VA）：页对齐的内核指针
+        uint64_t vaCand[8];
+        int nVa = 0;
+
+        for (int off = 0x8; off < 0x60; off += 8) {
+            uint32_t v32 = ds_kread32(pmap + off);
+            uint64_t v64 = ds_kreadptr(pmap + off);
+            if (nPa < 24) {
+                uint64_t cands[3] = {
+                    (uint64_t)v32, (uint64_t)v32 << 12, (uint64_t)v32 << 14,
+                };
+                for (int c = 0; c < 3 && nPa < 24; c++) {
+                    if (cands[c] >= 0x40000000ULL && cands[c] < 0x1000000000ULL &&
+                        (cands[c] & pageMask) == 0) {
+                        paCand[nPa++] = cands[c];
+                    }
+                }
+                if (nPa < 24 && v64 >= 0x40000000ULL && v64 < 0x1000000000ULL &&
+                    (v64 & pageMask) == 0) {
+                    paCand[nPa++] = v64;
+                }
+            }
+            if (nVa < 8 && (v64 >> 44) != 0 && (v64 & pageMask) == 0 &&
+                ds_isvalid(v64) &&
+                (VM_MIN_KERNEL_ADDRESS == 0 || v64 >= VM_MIN_KERNEL_ADDRESS) &&
+                (VM_MAX_KERNEL_ADDRESS == 0 || v64 <= VM_MAX_KERNEL_ADDRESS)) {
+                vaCand[nVa++] = v64;
+            }
+        }
+
+        // 匹配：tte 的 L1[0] 须为有效描述符，且存在 (ttep, 公式) 使 ptov(ttep)==tte
+        for (int a = 0; a < nVa; a++) {
+            uint64_t tte = vaCand[a];
+            uint64_t l1e0 = ds_kread64(tte); // 结构体内真实内核指针，读取安全
+            if (!(l1e0 & 1)) continue;       // L1[0] 须为有效描述符
+            for (int p = 0; p < nPa; p++) {
+                uint64_t ttep = paCand[p];
+                for (size_t f = 0; f < kNumFormulas; f++) {
+                    if (pe_ptov_kva_raw(ttep, kPtovFormulas[f].shift,
+                                        kPtovFormulas[f].add) != tte) {
+                        continue;
+                    }
+                    gGameTTBR0 = ttep;
+                    gGameL1KVA = tte;
+                    gPtovShift = kPtovFormulas[f].shift;
+                    gPtovIdxAdd = kPtovFormulas[f].add;
+                    PE_LOG("pmap=0x%llx（vm_map 候选 #%d）", (unsigned long long)pmap, m);
+                    PE_LOG("TTBR0(ttep)=0x%llx tte(L1 KVA)=0x%llx L1[0]=0x%llx",
+                           (unsigned long long)ttep, (unsigned long long)tte,
+                           (unsigned long long)l1e0);
+                    PE_LOG("ptov 公式验证成功：shift=%d idxAdd=%d（ptov(ttep)==tte）",
+                           kPtovFormulas[f].shift, kPtovFormulas[f].add);
+                    return true;
+                }
             }
         }
     }
-    PE_LOG_ERROR("pmap+0x10..0x40 未找到有效 TTBR0（pmap=0x%llx）",
-                 (unsigned long long)pmap);
-    pe_detail([NSString stringWithFormat:@"pmap+0x10..0x40 未找到有效 TTBR0（pmap=0x%llx）",
-               (unsigned long long)pmap]);
+
+    PE_LOG_ERROR("pmap 候选（%d 个）中未验证出 (ttep,tte,ptov公式) 三元组，请把控制台日志发回分析", nMap);
+    pe_detail(@"未能在 pmap 中验证页表三元组（ttep/tte/ptov 公式），候选详见控制台日志");
     return false;
 }
 
 // ---- 安全 VA → PA（自适应 4KB/16KB，全部经 ptov_table 换算） ----
 static uint64_t pe_va_to_pa(uint64_t va)
 {
-    if (!gGameTTBR0 || gPageShift == 0) return 0;
+    if (gPageShift == 0) return 0;
+    // L1 根表：优先用已验证的 tte（内核 VA）；否则经 ptov 换算 ttep
+    uint64_t l1root = gGameL1KVA ? gGameL1KVA : pe_pa_to_kva(gGameTTBR0);
+    if (!l1root) return 0;
 
     if (gPageShift == 12) {
         // ---- 4KB: L0(9)→L1(9)→L2(9) ----
@@ -318,8 +397,7 @@ static uint64_t pe_va_to_pa(uint64_t va)
         uint64_t l1 = (va >> 21) & 0x1FF;
         uint64_t l2 = (va >> 12) & 0x1FF;
 
-        uint64_t l0_kva = pe_pa_to_kva(gGameTTBR0);
-        if (!l0_kva) return 0;
+        uint64_t l0_kva = l1root;
         uint64_t l0e = ds_kread64(l0_kva + l0 * 8);
         if (!(l0e & 3)) return 0;
         if (l0e & 2) return (l0e & 0x0000FFFFC0000000ULL) | (va & 0x3FFFFFFF);
@@ -346,8 +424,7 @@ static uint64_t pe_va_to_pa(uint64_t va)
         uint64_t l2 = (va >> 25) & 0x7FF;
         uint64_t l3 = (va >> 14) & 0x7FF;
 
-        uint64_t l1_kva = pe_pa_to_kva(gGameTTBR0);
-        if (!l1_kva) return 0;
+        uint64_t l1_kva = l1root;
         uint64_t l1e = ds_kread64(l1_kva + l1 * 8);
         if (!(l1e & 3)) return 0;
         if (l1e & 2) {
