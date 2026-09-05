@@ -1,0 +1,48 @@
+//
+//  ReinBridge.h
+//  Rein
+//
+//  Bridge between Rein's UI and the bundled DarkSword runtime
+//  (adapted from DarkSpeed's DSBridge).
+//
+
+#import <Foundation/Foundation.h>
+
+NS_ASSUME_NONNULL_BEGIN
+
+/// Posted on any progress / stage / state change (observe on main queue).
+OBJC_EXTERN NSString * const ReinBridgeProgressNotification;
+
+/// YES after a successful DarkSword kernel bootstrap (KRW ready).
+OBJC_EXTERN BOOL ReinKernelIsReady(void);
+
+/// YES after a successful RemoteCall attach to SpringBoard.
+OBJC_EXTERN BOOL ReinRemoteCallIsReady(void);
+
+/// YES while the kernel bootstrap (or kernelcache prefetch) is running.
+OBJC_EXTERN BOOL ReinKernelIsRunning(void);
+
+/// YES while the RemoteCall initialization is running.
+OBJC_EXTERN BOOL ReinRemoteCallIsRunning(void);
+
+/// Last human-readable error (may be empty).
+OBJC_EXTERN NSString *ReinBridgeLastError(void);
+
+/// Current neutral, user-visible stage label (may be empty).
+OBJC_EXTERN NSString *ReinBridgeStage(void);
+
+/// DarkSword bootstrap progress (0.0 – 1.0).
+OBJC_EXTERN double ReinBridgeProgress(void);
+
+/// pid of the attached SpringBoard RemoteCall (0 when not attached).
+OBJC_EXTERN pid_t ReinRemoteCallPID(void);
+
+/// Button "初始化 DarkSword 内核": network warm-up + kernelcache prefetch +
+/// offsets + ds_run(). Asynchronous; observe ReinBridgeProgressNotification.
+OBJC_EXTERN void ReinInitializeDarkSwordKernel(void);
+
+/// Button "初始化 RemoteCall": attach RemoteCall to SpringBoard.
+/// Requires the kernel to be ready first. Asynchronous.
+OBJC_EXTERN void ReinInitializeRemoteCall(void);
+
+NS_ASSUME_NONNULL_END

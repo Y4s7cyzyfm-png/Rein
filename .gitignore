@@ -1,0 +1,15 @@
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xccheckout
+*.moved-aside
+
+# Codemagic artifacts
+Payload/
+Rein.tipa
+Rein.ipa
+
+# macOS
+.DS_Store

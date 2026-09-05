@@ -1,0 +1,119 @@
+workflows:
+  rein-tipa:
+    name: Rein TIPA (arm64e)
+    max_build_duration: 60
+    instance_type: mac_mini_m2
+    environment:
+      # Xcode 26.x for iOS 26 SDK / arm64e
+      xcode: latest
+      vars:
+        BUNDLE_ID: com.rein
+        APP_VERSION: 1.0.0
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: "*"
+          include: true
+          source: false
+    scripts:
+      - name: Build Rein (arm64e only, unsigned)
+        script: |
+          set -e
+          # Force arm64e single-arch (ARCHS=arm64e already set in the target config)
+          xcodebuild -project Rein.xcodeproj \
+            -scheme Rein \
+            -configuration Release \
+            -sdk iphoneos \
+            ARCHS=arm64e \
+            ONLY_ACTIVE_ARCH=YES \
+            VALID_ARCHS=arm64e \
+            MARKETING_VERSION=1.0.0 \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            SYMROOT=build \
+            clean build
+      - name: Verify architecture (arm64e only)
+        script: |
+          set -e
+          APP="build/Release-iphoneos/Rein.app"
+          if [ ! -d "$APP" ]; then
+            # fallback for derivedData-style or other layout
+            APP=$(find build -name "Rein.app" -type d | head -1)
+          fi
+          echo "Using APP=$APP"
+          BIN="$APP/Rein"
+          echo "== main binary =="
+          lipo -info "$BIN"
+          if ! lipo -info "$BIN" | grep -q "arm64e"; then
+            echo "[!] arm64e not found"; exit 1
+          fi
+          if lipo -info "$BIN" | grep -q ","; then
+            echo "[!] unexpected multi-arch binary"; exit 1
+          fi
+      - name: Stage resources & fake-sign
+        script: |
+          set -e
+          brew install ldid || true
+          APP="build/Release-iphoneos/Rein.app"
+          if [ ! -d "$APP" ]; then
+            APP=$(find build -name "Rein.app" -type d | head -1)
+          fi
+          ENT="supports/entitlements-rein.plist"
+          echo "APP=$APP ENT=$ENT"
+
+          # 主二进制伪签
+          ldid -S"$ENT" "$APP/Rein"
+
+          # 嵌入的 dylib（libxpf / libgrabkernel2）也必须伪签：
+          # CODE_SIGNING_ALLOWED=NO 时 dylib 无签名，dyld 直接拒绝加载 → 启动闪退。
+          mkdir -p "$APP/Frameworks"
+          # 优先 thin 版本（与 LIBRARY_SEARCH_PATHS 一致）
+          if [ -f Vendor/darksword-lib-thin/libxpf.dylib ]; then
+            cp -f Vendor/darksword-lib-thin/libxpf.dylib "$APP/Frameworks/"
+            cp -f Vendor/darksword-lib-thin/libgrabkernel2.dylib "$APP/Frameworks/"
+          else
+            cp -f Vendor/darksword-lib/libxpf.dylib "$APP/Frameworks/"
+            cp -f Vendor/darksword-lib/libgrabkernel2.dylib "$APP/Frameworks/"
+          fi
+          # 若同步组曾把同名 dylib 拷到 app 根目录，删掉避免双份未签文件。
+          rm -f "$APP"/libxpf.dylib "$APP"/libgrabkernel2.dylib
+          # 其余意外出现在 app 内的 dylib 统一收进 Frameworks 再签名
+          find "$APP" -name '*.dylib' -not -path "$APP/Frameworks/*" | while read -r dylib; do
+            mv -f "$dylib" "$APP/Frameworks/$(basename "$dylib")"
+          done
+          for dylib in "$APP"/Frameworks/*.dylib; do
+            [ -e "$dylib" ] || continue
+            ldid -S"$ENT" "$dylib"
+          done
+          echo "== 签名后的 Frameworks =="
+          ls -l "$APP/Frameworks" || true
+          # 硬校验：两个 dylib 必须存在
+          test -f "$APP/Frameworks/libxpf.dylib"
+          test -f "$APP/Frameworks/libgrabkernel2.dylib"
+          echo "[ok] libxpf / libgrabkernel2 staged & signed"
+      - name: Package .tipa / .ipa (Rein)
+        script: |
+          set -e
+          APP="build/Release-iphoneos/Rein.app"
+          if [ ! -d "$APP" ]; then
+            APP=$(find build -name "Rein.app" -type d | head -1)
+          fi
+          rm -rf Payload Rein.tipa Rein.ipa
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry Rein.tipa Payload
+          # 同一产物再输出一份 .ipa（名字 Rein.ipa）
+          cp Rein.tipa Rein.ipa
+          echo "== tipa 内容 =="
+          unzip -l Rein.tipa | head -40
+          # 产物校验：dylib 必须进包
+          unzip -l Rein.tipa | grep -q "Frameworks/libxpf.dylib"
+          unzip -l Rein.tipa | grep -q "Frameworks/libgrabkernel2.dylib"
+          echo "[ok] Rein.tipa / Rein.ipa contain dylibs"
+    artifacts:
+      - Rein.tipa
+      - Rein.ipa
