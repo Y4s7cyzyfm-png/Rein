@@ -6,6 +6,8 @@
 #import "FeaturesViewController.h"
 #import "MD3Theme.h"
 #import "MD3Components.h"
+#import "ReinBridge.h"
+#import "PeaceESP.h"
 
 static NSString * const kFeatureKeyPrefix = @"rein.feature.";
 
@@ -15,6 +17,9 @@ static NSString * const kFeatureKeyPrefix = @"rein.feature.";
 @property (nonatomic, strong) MD3FilledButton *reinFeatureButton;
 @property (nonatomic, strong) UIView *toastView;
 @property (nonatomic, strong) UILabel *toastLabel;
+@property (nonatomic, strong) NSTimer *espStateTimer;
+@property (nonatomic, copy, nullable) NSString *lastShownESPError;
+@property (nonatomic, assign) BOOL espStarting;
 @end
 
 @implementation FeaturesViewController
@@ -53,19 +58,53 @@ static NSString * const kFeatureKeyPrefix = @"rein.feature.";
     [self buildReinFeatureButton];
     [self buildFeatureSwitches];
     [self buildToast];
+
+    // 轮询 ESP 状态刷新按钮文案 / 展示异步错误
+    self.espStateTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
+                                                          target:self
+                                                        selector:@selector(espStateTick)
+                                                        userInfo:nil
+                                                         repeats:YES];
 }
 
-/// 「Rein功能暂定」按钮（SF 图标：restart.circle）
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    [self.espStateTimer invalidate];
+    self.espStateTimer = nil;
+}
+
+/// 「启动ESP」按钮（SF 图标：restart.circle）
 - (void)buildReinFeatureButton {
-    self.reinFeatureButton = [MD3FilledButton buttonWithTitle:@"Rein功能暂定"
+    self.reinFeatureButton = [MD3FilledButton buttonWithTitle:@"启动ESP"
                                                    systemIcon:@"restart.circle"
                                                         style:0];
     [self.stack addArrangedSubview:self.reinFeatureButton];
 
     __weak typeof(self) weakSelf = self;
     self.reinFeatureButton.onTap = ^(MD3FilledButton *button) {
-        [weakSelf reinFeatureTapped:button];
+        [weakSelf espTapped:button];
     };
+}
+
+- (void)espStateTick {
+    BOOL running = PeaceESPIsRunning();
+
+    // 异步启动失败时弹一次错误并复位按钮
+    NSString *error = PeaceESPLastError();
+    if (error.length > 0 && ![error isEqualToString:self.lastShownESPError]) {
+        self.lastShownESPError = error;
+        self.espStarting = NO;
+        [self showToast:error];
+    } else if (error.length == 0) {
+        self.lastShownESPError = nil;
+    }
+
+    if (running) {
+        self.espStarting = NO;
+        [self.reinFeatureButton setTitle:@"停止ESP"];
+    } else if (!self.espStarting) {
+        [self.reinFeatureButton setTitle:@"启动ESP"];
+    }
 }
 
 - (void)buildFeatureSwitches {
@@ -166,8 +205,29 @@ static NSString * const kFeatureKeyPrefix = @"rein.feature.";
     ]];
 }
 
-- (void)reinFeatureTapped:(MD3FilledButton *)sender {
-    // 暂定占位：后续在此接入实际功能。
+- (void)espTapped:(MD3FilledButton *)sender {
+    if (PeaceESPIsRunning()) {
+        PeaceESPStop();
+        [self.reinFeatureButton setTitle:@"启动ESP"];
+        return;
+    }
+
+    if (!ReinKernelIsReady()) {
+        [self showToast:@"请先在「内核」页面初始化 DarkSword 内核"];
+        return;
+    }
+    if (!ReinRemoteCallIsReady()) {
+        [self showToast:@"请先在「内核」页面初始化 RemoteCall"];
+        return;
+    }
+
+    [self.reinFeatureButton setTitle:@"启动中…"];
+    self.espStarting = YES;
+    PeaceESPStart();
+}
+
+- (void)showToast:(NSString *)message {
+    self.toastLabel.text = message;
     self.toastView.alpha = 0;
     self.toastView.hidden = NO;
     [UIView animateWithDuration:0.2
@@ -178,7 +238,7 @@ static NSString * const kFeatureKeyPrefix = @"rein.feature.";
                      }
                      completion:^(BOOL finished) {
                          dispatch_after(
-                             dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
+                             dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)),
                              dispatch_get_main_queue(), ^{
                                  [UIView animateWithDuration:0.25
                                                        animations:^{

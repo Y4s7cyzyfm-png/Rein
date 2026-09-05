@@ -48,11 +48,17 @@
     self.titleLabel = title;
 
     UILabel *subtitle = [[UILabel alloc] init];
-    subtitle.text = @"内核 · 功能";
+    subtitle.text = @"点我加入Telegram频道";
     subtitle.font = MD3Theme.bodyFont;
-    subtitle.textColor = MD3Theme.onSurfaceVariantColor;
+    subtitle.textColor = MD3Theme.primaryColor;
     subtitle.translatesAutoresizingMaskIntoConstraints = NO;
+    subtitle.userInteractionEnabled = YES;
     [appBar addSubview:subtitle];
+
+    UITapGestureRecognizer *subtitleTap =
+        [[UITapGestureRecognizer alloc] initWithTarget:self
+                                                action:@selector(subtitleTapped:)];
+    [subtitle addGestureRecognizer:subtitleTap];
 
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
@@ -67,6 +73,14 @@
         [subtitle.leadingAnchor constraintEqualToAnchor:appBar.leadingAnchor constant:20],
         [subtitle.topAnchor constraintEqualToAnchor:appBar.centerYAnchor constant:2],
     ]];
+}
+
+- (void)subtitleTapped:(UITapGestureRecognizer *)sender {
+    NSURL *url = [NSURL URLWithString:@"https://t.me/xiaoniannya520"];
+    if (!url) return;
+    [[UIApplication sharedApplication] openURL:url
+                                       options:@{}
+                             completionHandler:nil];
 }
 
 - (void)buildTabBar {

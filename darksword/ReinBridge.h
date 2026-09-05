@@ -7,6 +7,7 @@
 //
 
 #import <Foundation/Foundation.h>
+#import "DSRemoteCall.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -44,5 +45,13 @@ OBJC_EXTERN void ReinInitializeDarkSwordKernel(void);
 /// Button "初始化 RemoteCall": attach RemoteCall to SpringBoard.
 /// Requires the kernel to be ready first. Asynchronous.
 OBJC_EXTERN void ReinInitializeRemoteCall(void);
+
+/// The live RemoteCall session attached to SpringBoard
+/// (NULL until "初始化 RemoteCall" succeeded). Do not destroy it.
+OBJC_EXTERN RemoteCall * _Nullable ReinBridgeRemoteCall(void);
+
+/// Button "读取游戏进程": locate ShadowTrackerExtra via kernel proc walk.
+/// Requires the kernel to be ready. Synchronous (fast). Returns the pid.
+OBJC_EXTERN BOOL ReinReadGameProcess(int * _Nullable outPid);
 
 NS_ASSUME_NONNULL_END

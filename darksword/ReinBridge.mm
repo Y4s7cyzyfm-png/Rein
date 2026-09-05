@@ -467,3 +467,31 @@ void ReinInitializeRemoteCall(void) {
         }
     });
 }
+
+RemoteCall *ReinBridgeRemoteCall(void) {
+    return g_springBoard;
+}
+
+BOOL ReinReadGameProcess(int *outPid) {
+    if (!ReinKernelIsReady()) {
+        rein_set_error(@"请先初始化 DarkSword 内核，再读取游戏进程。");
+        rein_set_stage(@"内核未就绪");
+        rein_post_progress();
+        return NO;
+    }
+
+    uint64_t proc = proc_find_by_name("ShadowTrackerExtra");
+    if (!proc) {
+        rein_set_error(@"未找到游戏进程 ShadowTrackerExtra，请确认游戏已启动。");
+        rein_set_stage(@"游戏进程未找到");
+        rein_post_progress();
+        return NO;
+    }
+
+    uint32_t pid = ds_kread32(proc + off_proc_p_pid);
+    if (outPid) *outPid = (int)pid;
+    rein_set_error(@"");
+    rein_set_stage([NSString stringWithFormat:@"游戏进程已找到（pid %u）", pid]);
+    rein_post_progress();
+    return YES;
+}

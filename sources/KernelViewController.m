@@ -20,6 +20,13 @@
 
 @property (nonatomic, strong) MD3FilledButton *kernelInitButton;
 @property (nonatomic, strong) MD3FilledButton *remoteCallInitButton;
+
+@property (nonatomic, strong) UILabel *gameStateLabel;
+@property (nonatomic, strong) MD3FilledButton *readGameButton;
+@property (nonatomic, strong) MD3FilledButton *dumpSDKButton;
+
+@property (nonatomic, strong) UIView *toastView;
+@property (nonatomic, strong) UILabel *toastLabel;
 @end
 
 @implementation KernelViewController
@@ -57,6 +64,8 @@
 
     [self buildStatusCard];
     [self buildActionsCard];
+    [self buildGameCard];
+    [self buildToast];
 
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(bridgeDidChange:)
@@ -210,6 +219,68 @@
     };
 }
 
+- (void)buildGameCard {
+    MD3CardView *card = [[MD3CardView alloc] init];
+    [self.stack addArrangedSubview:card];
+
+    UILabel *cardTitle = [[UILabel alloc] init];
+    cardTitle.text = @"游戏";
+    cardTitle.font = MD3Theme.titleFont;
+    cardTitle.textColor = MD3Theme.onSurfaceColor;
+    cardTitle.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:cardTitle];
+
+    self.gameStateLabel = [[UILabel alloc] init];
+    self.gameStateLabel.font = MD3Theme.bodyFont;
+    self.gameStateLabel.textColor = MD3Theme.onSurfaceVariantColor;
+    self.gameStateLabel.numberOfLines = 0;
+    self.gameStateLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:self.gameStateLabel];
+
+    self.readGameButton = [MD3FilledButton buttonWithTitle:@"读取游戏进程"
+                                               systemIcon:@"gamecontroller"
+                                                    style:0];
+    [card addSubview:self.readGameButton];
+
+    self.dumpSDKButton = [MD3FilledButton buttonWithTitle:@"Dump UE4 SDK"
+                                             systemIcon:@"doc.text.magnifyingglass"
+                                                  style:1];
+    [card addSubview:self.dumpSDKButton];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [cardTitle.topAnchor constraintEqualToAnchor:card.topAnchor constant:16],
+        [cardTitle.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+        [cardTitle.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
+
+        [self.gameStateLabel.topAnchor constraintEqualToAnchor:cardTitle.bottomAnchor constant:12],
+        [self.gameStateLabel.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+        [self.gameStateLabel.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
+
+        [self.readGameButton.topAnchor constraintEqualToAnchor:self.gameStateLabel.bottomAnchor constant:12],
+        [self.readGameButton.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+        [self.readGameButton.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
+
+        [self.dumpSDKButton.topAnchor constraintEqualToAnchor:self.readGameButton.bottomAnchor constant:12],
+        [self.dumpSDKButton.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+        [self.dumpSDKButton.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
+        [self.dumpSDKButton.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-16],
+    ]];
+
+    __weak typeof(self) weakSelf = self;
+    self.readGameButton.onTap = ^(MD3FilledButton *button) {
+        [weakSelf readGameTapped:button];
+    };
+    self.dumpSDKButton.onTap = ^(MD3FilledButton *button) {
+        [weakSelf dumpSDKTapped:button];
+    };
+
+    [self reloadGameState:@"未读取"];
+}
+
+- (void)reloadGameState:(NSString *)state {
+    self.gameStateLabel.text = [NSString stringWithFormat:@"游戏进程：%@", state];
+}
+
 #pragma mark - Actions
 
 - (void)kernelInitTapped:(MD3FilledButton *)sender {
@@ -233,6 +304,100 @@
 
     ReinInitializeRemoteCall();
     [self reloadState];
+}
+
+- (void)readGameTapped:(MD3FilledButton *)sender {
+    if (!ReinKernelIsReady()) {
+        [self showToast:@"请先初始化 DarkSword 内核"];
+        return;
+    }
+
+    [self.readGameButton setEnabled:NO];
+    [self.readGameButton setTitle:@"正在读取…"];
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        int pid = 0;
+        BOOL found = ReinReadGameProcess(&pid);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            [strongSelf.readGameButton setEnabled:YES];
+            [strongSelf.readGameButton setTitle:@"读取游戏进程"];
+            if (found) {
+                [strongSelf reloadGameState:[NSString
+                    stringWithFormat:@"ShadowTrackerExtra（pid %d）", pid]];
+                [strongSelf showToast:@"游戏进程已找到"];
+            } else {
+                [strongSelf reloadGameState:@"未找到"];
+                [strongSelf showToast:ReinBridgeLastError().length > 0
+                    ? ReinBridgeLastError() : @"未找到游戏进程"];
+            }
+        });
+    });
+}
+
+- (void)dumpSDKTapped:(MD3FilledButton *)sender {
+    // 占位：后续接入实际的 UE4 SDK Dump 功能。
+    [self showToast:@"Dump UE4 SDK 功能开发中，敬请期待"];
+}
+
+#pragma mark - Toast
+
+- (void)buildToast {
+    self.toastView = [[UIView alloc] init];
+    self.toastView.backgroundColor = [MD3Theme.onSurfaceColor colorWithAlphaComponent:0.92];
+    self.toastView.layer.cornerRadius = 20;
+    self.toastView.layer.cornerCurve = kCACornerCurveContinuous;
+    self.toastView.userInteractionEnabled = NO;
+    self.toastView.hidden = YES;
+    self.toastView.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:self.toastView];
+
+    self.toastLabel = [[UILabel alloc] init];
+    self.toastLabel.font = MD3Theme.labelFont;
+    self.toastLabel.textColor = MD3Theme.backgroundColor;
+    self.toastLabel.textAlignment = NSTextAlignmentCenter;
+    self.toastLabel.numberOfLines = 0;
+    self.toastLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.toastView addSubview:self.toastLabel];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.toastView.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+        [self.toastView.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor
+                                                    constant:-24],
+        [self.toastView.heightAnchor constraintGreaterThanOrEqualToConstant:40],
+        [self.toastView.widthAnchor constraintGreaterThanOrEqualToConstant:180],
+
+        [self.toastLabel.topAnchor constraintEqualToAnchor:self.toastView.topAnchor constant:10],
+        [self.toastLabel.bottomAnchor constraintEqualToAnchor:self.toastView.bottomAnchor constant:-10],
+        [self.toastLabel.leadingAnchor constraintEqualToAnchor:self.toastView.leadingAnchor constant:20],
+        [self.toastLabel.trailingAnchor constraintEqualToAnchor:self.toastView.trailingAnchor constant:-20],
+    ]];
+}
+
+- (void)showToast:(NSString *)message {
+    self.toastLabel.text = message;
+    self.toastView.alpha = 0;
+    self.toastView.hidden = NO;
+    [UIView animateWithDuration:0.2
+                          delay:0
+                        options:UIViewAnimationOptionCurveEaseOut
+                     animations:^{
+                         self.toastView.alpha = 1;
+                     }
+                     completion:^(BOOL finished) {
+                         dispatch_after(
+                             dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)),
+                             dispatch_get_main_queue(), ^{
+                                 [UIView animateWithDuration:0.25
+                                                       animations:^{
+                                                           self.toastView.alpha = 0;
+                                                       }
+                                                       completion:^(BOOL done) {
+                                                           self.toastView.hidden = YES;
+                                                       }];
+                             });
+                     }];
 }
 
 #pragma mark - State
