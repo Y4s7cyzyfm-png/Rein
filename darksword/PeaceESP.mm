@@ -518,7 +518,7 @@ enum {
     O_BONEPTR   = 0x838,  // 骨骼指针
 
     // 关卡 / Actor 数组（沿用旧值，本次未提供新数据）
-    O_PERSISTLEVEL = 0xB8, O_ACTORS = 0xA0, O_ACTORCNT = 0xA8,
+    O_PERSISTLEVEL = 0xB0, O_ACTORS = 0xA0, O_ACTORCNT = 0xB8,
 
     // ---- 以下为 2026-09 新增功能偏移（已录入，功能逐步接入） ----
 
