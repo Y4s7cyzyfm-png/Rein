@@ -493,7 +493,7 @@ enum {
 
     // 相机（PC → 相机指针 0x680 → CameraCache/POV 沿用旧值，待验证）
     O_CAMPTR  = 0x680,  // 相机指针（自 PC）
-    O_CAMCACHE = 0x640, // Cache 条目指针（自相机；POV 在 Cache+0x28）
+    O_CAMCACHE = 0x650, // Cache 条目指针（自相机；POV 在 Cache+0x28）
 
     // Actor / Pawn 字段（安卓 SDK 对照表，iOS 同源）
     O_ROOTCOMP  = 0x260,  // 坐标1（RootComponent 指针）
