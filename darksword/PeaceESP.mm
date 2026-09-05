@@ -766,42 +766,45 @@ static bool pe_vp(PECamera *cam) {
     uint64_t pawn = c ? kread64(c + O_SELF5) : 0;
     uint64_t pc   = pawn ? kread64(pawn + O_PC_FROM_PAWN) : 0;
     uint64_t camPtr = pc ? kread64(pc + O_CAMPTR) : 0;
-    uint64_t cache  = camPtr ? kread64(camPtr + O_CAMCACHE) : 0;
-    if (!cache || cache < 0x100000000ULL || cache >= 0x800000000ULL) {
+    if (!camPtr || camPtr < 0x100000000ULL || camPtr >= 0x800000000ULL) {
         if (gFailVp < 3) {
             PE_LOG_ERROR("相机链断链：GWorld=0x%llx +0x%x→0x%llx +0x%x→0x%llx +0x%x→0x%llx "
-                         "+0x%x(Pawn)→0x%llx +0x%x(PC)→0x%llx +0x%x(相机)→0x%llx +0x%x(Cache)→0x%llx",
+                         "+0x%x(Pawn)→0x%llx +0x%x(PC)→0x%llx +0x%x(相机)→0x%llx",
                          (unsigned long long)g, O_SELF2, (unsigned long long)a,
                          O_SELF3, (unsigned long long)b,
                          O_SELF4, (unsigned long long)c,
                          O_SELF5, (unsigned long long)pawn,
                          O_PC_FROM_PAWN, (unsigned long long)pc,
-                         O_CAMPTR, (unsigned long long)camPtr,
-                         O_CAMCACHE, (unsigned long long)cache);
+                         O_CAMPTR, (unsigned long long)camPtr);
             gFailVp++;
         }
         return false;
     }
-    // POV：loc/rot/fov 一次读完（含头 0x28 = 40 字节 + 28 = 68 字节，同页内）
+    // POV 内嵌在相机对象 +0x640（表：Fov3[+0x40] 0x0640——FOV 在该结构 +0x40）。
+    // 之前把它当指针解引用读到 0x4104b96f/0x403462e3，按 float 正是 8.14/3.05
+    // ——UE4 FCameraCacheEntry.TimeStamp（秒），证实结构是内嵌的：
+    //   +0x00 TimeStamp(float)  +0x28 Location  +0x34 Rotation  +0x40 FOV
+    uint64_t povBase = camPtr + O_CAMCACHE;
+    // POV：+0x28 Location / +0x34 Rotation / +0x40 FOV，一次读完（0x28+0x1C = 68 字节）
     unsigned char buf[68];
-    if (!kreadbuf(cache + 0x28, buf, sizeof(buf))) {
+    if (!kreadbuf(povBase + 0x28, buf, sizeof(buf))) {
         if (gFailVp < 3) {
-            PE_LOG_ERROR("POV 读取失败：Cache=0x%llx +0x28（POV 布局可能不符）",
-                         (unsigned long long)cache);
+            PE_LOG_ERROR("POV 读取失败：相机=0x%llx +0x%x +0x28（POV 布局可能不符）",
+                         (unsigned long long)camPtr, O_CAMCACHE);
             gFailVp++;
         }
         return false;
     }
-    memcpy(&cam->loc, buf, 12);
-    memcpy(&cam->rot, buf + 0xC, 12);
-    memcpy(&cam->fov, buf + 0x18, 4);
+    memcpy(&cam->loc, buf, 12);        // +0x28
+    memcpy(&cam->rot, buf + 0xC, 12);  // +0x34
+    memcpy(&cam->fov, buf + 0x18, 4);  // +0x40
     // 合理性校验：FOV 10..170，位置在用户态量级
     if (cam->fov < 10.0f || cam->fov > 170.0f ||
         fabsf(cam->loc.x) > 1e7f || fabsf(cam->loc.y) > 1e7f || fabsf(cam->loc.z) > 1e7f) {
         if (gFailVp < 3) {
-            PE_LOG_ERROR("POV 数据可疑：Cache=0x%llx loc=(%.1f,%.1f,%.1f) rot=(%.1f,%.1f,%.1f) fov=%.1f"
-                         "（POV 起点可能不是 0x28，把此日志发回分析）",
-                         (unsigned long long)cache,
+            PE_LOG_ERROR("POV 数据可疑：相机=0x%llx loc=(%.1f,%.1f,%.1f) rot=(%.1f,%.1f,%.1f) fov=%.1f"
+                         "（把此日志发回分析）",
+                         (unsigned long long)camPtr,
                          cam->loc.x, cam->loc.y, cam->loc.z,
                          cam->rot.x, cam->rot.y, cam->rot.z, cam->fov);
             gFailVp++;
