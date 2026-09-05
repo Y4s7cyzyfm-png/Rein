@@ -98,18 +98,26 @@ static NSString *rein_console_fmt(NSString *fmt) {
     return [fmt stringByReplacingOccurrencesOfString:@"%{public}" withString:@""];
 }
 
+// fmt 恒为宏调用处的字面量；stringWithFormat 收到的是 rein_console_fmt()
+// 的返回值（非字面量、无格式化参数），会触发 -Wformat-security，在宏内显式豁免。
 #define RB_LOG(fmt, ...) \
     do { \
+        _Pragma("clang diagnostic push") \
+        _Pragma("clang diagnostic ignored \"-Wformat-security\"") \
         os_log(OS_LOG_DEFAULT, "[ReinBridge] " fmt, ##__VA_ARGS__); \
         ReinAppendConsoleLog([NSString \
             stringWithFormat:rein_console_fmt(@"[ReinBridge] " fmt), ##__VA_ARGS__]); \
+        _Pragma("clang diagnostic pop") \
     } while (0)
 
 #define RB_LOG_ERROR(fmt, ...) \
     do { \
+        _Pragma("clang diagnostic push") \
+        _Pragma("clang diagnostic ignored \"-Wformat-security\"") \
         os_log_error(OS_LOG_DEFAULT, "[ReinBridge] " fmt, ##__VA_ARGS__); \
         ReinAppendConsoleLog([NSString \
             stringWithFormat:rein_console_fmt(@"[ReinBridge] " fmt), ##__VA_ARGS__]); \
+        _Pragma("clang diagnostic pop") \
     } while (0)
 
 // ---------------------------------------------------------------------------

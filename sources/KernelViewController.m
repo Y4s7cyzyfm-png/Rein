@@ -10,7 +10,7 @@
 
 #pragma mark - Console log viewer（内核页「控制台日志」实时查看器）
 
-@interface ConsoleLogViewController ()
+@interface ConsoleLogViewController : UIViewController
 @property (nonatomic, strong) UITextView *textView;
 @property (nonatomic, strong) UILabel *countLabel;
 @property (nonatomic, strong) UIButton *copyButton;

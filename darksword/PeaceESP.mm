@@ -53,18 +53,26 @@ static NSString *pe_console_fmt(NSString *fmt) {
 }
 
 // PE_LOG：os_log（Console.app 可见）+ 镜像到 ReinBridge 内存日志（App 内查看器可见）
+// fmt 恒为宏调用处的字面量；stringWithFormat 收到的是 pe_console_fmt()
+// 的返回值（非字面量、无格式化参数），会触发 -Wformat-security，在宏内显式豁免。
 #define PE_LOG(fmt, ...) \
     do { \
+        _Pragma("clang diagnostic push") \
+        _Pragma("clang diagnostic ignored \"-Wformat-security\"") \
         os_log(pe_log_handle(), "[PE] " fmt, ##__VA_ARGS__); \
         ReinAppendConsoleLog([NSString \
             stringWithFormat:pe_console_fmt(@"[PE] " fmt), ##__VA_ARGS__]); \
+        _Pragma("clang diagnostic pop") \
     } while (0)
 
 #define PE_LOG_ERROR(fmt, ...) \
     do { \
+        _Pragma("clang diagnostic push") \
+        _Pragma("clang diagnostic ignored \"-Wformat-security\"") \
         os_log_error(pe_log_handle(), "[PE] " fmt, ##__VA_ARGS__); \
         ReinAppendConsoleLog([NSString \
             stringWithFormat:pe_console_fmt(@"[PE] " fmt), ##__VA_ARGS__]); \
+        _Pragma("clang diagnostic pop") \
     } while (0)
 
 /// 记录初始化失败的具体原因（拼进 PeaceESPLastError 的提示，并输出错误级日志）
