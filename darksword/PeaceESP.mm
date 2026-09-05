@@ -2,7 +2,9 @@
 //  PeaceESP.mm
 //  Rein
 //
-//  v5-safe 结构（自适应 4KB/16KB 页面、多策略 physmap 扫描、KVA 边界检查），
+//  v6-safe：自适应 4KB/16KB 页面；PA→KVA 一律经内核官方 ptov_table 换算
+//  （由 libxpf 从 kernelcache 解析符号，读取仅触及内核 data 段，安全），
+//  绝不探测任意 KVA——探测会触发 copy_validate_kernel_addr 内核 panic。
 //  远程 ObjC 调用层移植自 DarkSpeed 的 DSBridge（NSInvocation on SB main thread）。
 //
 
@@ -24,6 +26,8 @@
 extern "C" {
 #import "darksword.h"
 #import "utils.h"
+#import "offsets.h"
+#import "xpf.h"
 }
 
 // ============================================================
@@ -36,7 +40,10 @@ extern "C" {
 #define PE_DEFAULT_INTERVAL  0.033
 #define PE_FAR_CLIP          40000.0f
 #define PE_PLAYER_HEIGHT     175.0f
-#define PE_MAX_PHYS_RAM      0x200000000ULL
+
+// XNU ptov_table：32 条目，每条覆盖 64GB 物理地址段（PTOV_SHIFT = 36）
+#define PE_PTOV_SIZE  32
+#define PE_PTOV_SHIFT 36
 
 // ============================================================
 // 基础类型
@@ -67,18 +74,29 @@ static uint64_t gFrames = 0, gGameBase = 0;
 static PE_Vec3  gMyPos = {0};
 
 // ============================================================
-// 内核内存读取基础设施（physmap + 页表）
+// 内核内存读取基础设施（ptov_table + 页表）
 // ============================================================
 
-static uint64_t gPhysBase  = 0;
-static uint64_t gGameTTBR0 = 0;
-static int      gPageShift = 0;  // 12=4KB, 14=16KB
+static uint64_t gGameTTBR0 = 0;          // 游戏进程页表基址（PA）
+static int      gPageShift = 0;          // 12=4KB, 14=16KB
+static uint64_t gPtovTable[PE_PTOV_SIZE]; // XNU ptov_table 缓存
+static bool     gPtovReady = false;
 
-// ---- KVA 安全验证 ----
-static inline bool pe_is_safe_kva(uint64_t kva) {
-    return gPhysBase != 0 && kva >= gPhysBase && kva < gPhysBase + PE_MAX_PHYS_RAM;
+// ---- PA → KVA：只经内核官方 ptov_table 换算，无映射即失败 ----
+// 绝不探测任意内核地址：ds_kread 对非法 KVA 会触发
+// copy_validate_kernel_addr 内核 panic（真机已验证）。
+static uint64_t pe_pa_to_kva(uint64_t pa) {
+    if (!gPtovReady) return 0;
+    uint64_t idx = (pa >> PE_PTOV_SHIFT) & (PE_PTOV_SIZE - 1);
+    uint64_t off = gPtovTable[idx];
+    if (!off) return 0; // 该物理段无 physmap 映射
+    uint64_t kva = off + pa;
+    if (!ds_isvalid(kva)) return 0;
+    // offsets 机制解析出的内核 VA 布局边界（xpf "translation" set）
+    if (VM_MIN_KERNEL_ADDRESS != 0 && kva < VM_MIN_KERNEL_ADDRESS) return 0;
+    if (VM_MAX_KERNEL_ADDRESS != 0 && kva > VM_MAX_KERNEL_ADDRESS) return 0;
+    return kva;
 }
-static inline uint64_t pa2kva(uint64_t pa) { return gPhysBase + pa; }
 
 // ---- 检测页大小 ----
 static void pe_detect_page_size(void)
@@ -93,66 +111,60 @@ static void pe_detect_page_size(void)
     printf("[PE] page_size=%d shift=%d\n", 1 << gPageShift, gPageShift);
 }
 
-// ---- physmap 多策略扫描 ----
-static void pe_init_physmap(void)
+// ---- 解析 ptov_table 符号并缓存映射表 ----
+// 符号经 libxpf 从 Documents/kernelcache 解析（只解析不运行），
+// 表本体位于内核 __data 段，ds_kread 读取安全。
+static bool pe_init_ptov(void)
 {
-    if (gPhysBase != 0) return;
-    pe_detect_page_size();
+    if (gPtovReady) return true;
 
-    // 候选列表（涵盖常见的 iOS 内核 physmap 基址）
-    uint64_t candidates[] = {
-        0xFFFFFFF800000000ULL,
-        0xFFFFFFF000000000ULL,
-        0xFFFFFFF400000000ULL,
-        0xFFFFFFFC00000000ULL,
-        0xFFFFFFFE00000000ULL,
-        0xFFFFFFFD00000000ULL,
-        0xFFFFFFFA00000000ULL,
-        0xFFFFFFF600000000ULL,
-        0xFFFFFFF200000000ULL,
-        0xFFFFFFF100000000ULL,
-        0xFFFFFFF900000000ULL,
-        0xFFFFFFFB00000000ULL,
-    };
-    int nc = sizeof(candidates) / sizeof(candidates[0]);
-
-    for (int i = 0; i < nc; i++) {
-        uint64_t base = candidates[i];
-        // 验证：读两个相隔 0x1000 的位置，值应不同且非全0/全F
-        uint64_t v0 = ds_kread64(base);
-        if (v0 == 0 || v0 == 0xFFFFFFFFFFFFFFFFULL) continue;
-        uint64_t v1 = ds_kread64(base + 0x1000);
-        if (v1 == 0 || v1 == 0xFFFFFFFFFFFFFFFFULL) continue;
-        if (v0 == v1) continue; // 同样的值可能不是真实物理内存
-
-        // 额外验证：读更大偏移
-        uint64_t v2 = ds_kread64(base + 0x100000);
-        if (v2 == 0 || v2 == 0xFFFFFFFFFFFFFFFFULL) continue;
-
-        gPhysBase = base;
-        printf("[PE] physmap=0x%llx (cand#%d v0=0x%llx v1=0x%llx v2=0x%llx)\n",
-               gPhysBase, i, v0, v1, v2);
-        return;
+    NSString *docs = NSSearchPathForDirectoriesInDomains(
+        NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSString *kc = docs.length ? [docs stringByAppendingPathComponent:@"kernelcache"] : nil;
+    if (!kc || ![[NSFileManager defaultManager] fileExistsAtPath:kc]) {
+        printf("[PE] kernelcache 不存在，无法解析 ptov_table\n");
+        return false;
     }
 
-    // 大范围扫描回退
-    for (uint64_t probe = 0xFFFFFFF000000000ULL;
-         probe < 0xFFFFFFFFF0000000ULL;
-         probe += 0x200000000ULL) {
-        uint64_t v0 = ds_kread64(probe);
-        if (v0 == 0 || v0 == 0xFFFFFFFFFFFFFFFFULL) continue;
-        uint64_t v1 = ds_kread64(probe + 0x1000);
-        if (v1 == 0 || v1 == 0xFFFFFFFFFFFFFFFFULL || v1 == v0) continue;
-        uint64_t v2 = ds_kread64(probe + 0x100000);
-        if (v2 == 0 || v2 == 0xFFFFFFFFFFFFFFFFULL) continue;
-        gPhysBase = probe;
-        printf("[PE] physmap=0x%llx (scan)\n", gPhysBase);
-        return;
+    if (xpf_start_with_kernel_path(kc.UTF8String) != 0) {
+        printf("[PE] xpf start 失败: %s\n", xpf_get_error());
+        return false;
+    }
+    uint64_t sym = xpf_item_resolve("kernelSymbol.ptov_table");
+    uint64_t fileBase = gXPF.kernelBase;
+    xpf_stop();
+
+    if (!sym || !fileBase || sym < fileBase) {
+        printf("[PE] ptov_table 符号解析失败（sym=0x%llx fileBase=0x%llx）\n", sym, fileBase);
+        return false;
     }
 
-    // 全部失败
-    printf("[PE] *** FATAL: physmap NOT FOUND ***\n");
-    gPhysBase = 0;
+    uint64_t runtime = sym - fileBase + ds_get_kernel_base();
+    printf("[PE] ptov_table: sym=0x%llx runtime=0x%llx\n", sym, runtime);
+
+    uint64_t table[PE_PTOV_SIZE];
+    memset(table, 0, sizeof(table));
+    ds_kread(runtime, table, sizeof(table));
+
+    int valid = 0;
+    for (int i = 0; i < PE_PTOV_SIZE; i++) {
+        gPtovTable[i] = table[i];
+        if (table[i]) valid++;
+    }
+    if (valid == 0) {
+        printf("[PE] ptov_table 全零，无法建立 PA→KVA 映射\n");
+        return false;
+    }
+
+    gPtovReady = true;
+    printf("[PE] ptov_table 就绪（%d 个映射段）\n", valid);
+    for (int i = 0; i < PE_PTOV_SIZE; i++) {
+        if (gPtovTable[i]) {
+            printf("[PE]   seg[%d] off=0x%llx → VA base=0x%llx\n",
+                   i, gPtovTable[i], gPtovTable[i] + ((uint64_t)i << PE_PTOV_SHIFT));
+        }
+    }
+    return true;
 }
 
 // ---- 游戏 pmap → TTBR0 ----
@@ -187,9 +199,9 @@ static bool pe_init_game_pmap(void)
     for (int off = 0; off < 0x40; off += 8) {
         uint64_t val = ds_kread64(pmap + off);
         if (val > 0x100000000ULL && val < 0x1000000000ULL && (val & 0xFFF) == 0) {
-            if (!gPhysBase) continue;
-            uint64_t l1_kva = gPhysBase + val;
-            if (!pe_is_safe_kva(l1_kva)) continue;
+            // 候选 TTBR0（PA）：经 ptov_table 安全换算后再验证
+            uint64_t l1_kva = pe_pa_to_kva(val);
+            if (!l1_kva) continue;
             uint64_t l1e = ds_kread64(l1_kva);
             if (l1e != 0 && l1e != 0xFFFFFFFFFFFFFFFFULL) {
                 gGameTTBR0 = val;
@@ -202,10 +214,10 @@ static bool pe_init_game_pmap(void)
     return false;
 }
 
-// ---- 安全 VA → PA（自适应 4KB/16KB） ----
+// ---- 安全 VA → PA（自适应 4KB/16KB，全部经 ptov_table 换算） ----
 static uint64_t pe_va_to_pa(uint64_t va)
 {
-    if (!gGameTTBR0 || !gPhysBase || gPageShift == 0) return 0;
+    if (!gGameTTBR0 || gPageShift == 0) return 0;
 
     if (gPageShift == 12) {
         // ---- 4KB: L0(9)→L1(9)→L2(9) ----
@@ -213,29 +225,27 @@ static uint64_t pe_va_to_pa(uint64_t va)
         uint64_t l1 = (va >> 21) & 0x1FF;
         uint64_t l2 = (va >> 12) & 0x1FF;
 
-        uint64_t l0_kva = gPhysBase + gGameTTBR0 + l0 * 8;
-        if (!pe_is_safe_kva(l0_kva)) return 0;
-        uint64_t l0e = ds_kread64(l0_kva);
+        uint64_t l0_kva = pe_pa_to_kva(gGameTTBR0);
+        if (!l0_kva) return 0;
+        uint64_t l0e = ds_kread64(l0_kva + l0 * 8);
         if (!(l0e & 3)) return 0;
         if (l0e & 2) return (l0e & 0x0000FFFFC0000000ULL) | (va & 0x3FFFFFFF);
 
         uint64_t l1pa = l0e & 0x0000FFFFFFFFF000ULL;
         if (!l1pa) return 0;
-        uint64_t l1_kva = gPhysBase + l1pa + l1 * 8;
-        if (!pe_is_safe_kva(l1_kva)) return 0;
-        uint64_t l1e = ds_kread64(l1_kva);
+        uint64_t l1_kva = pe_pa_to_kva(l1pa);
+        if (!l1_kva) return 0;
+        uint64_t l1e = ds_kread64(l1_kva + l1 * 8);
         if (!(l1e & 3)) return 0;
         if (l1e & 2) return (l1e & 0x0000FFFFFE000000ULL) | (va & 0x1FFFFF);
 
         uint64_t l2pa = l1e & 0x0000FFFFFFFFF000ULL;
         if (!l2pa) return 0;
-        uint64_t l2_kva = gPhysBase + l2pa + l2 * 8;
-        if (!pe_is_safe_kva(l2_kva)) return 0;
-        uint64_t l2e = ds_kread64(l2_kva);
+        uint64_t l2_kva = pe_pa_to_kva(l2pa);
+        if (!l2_kva) return 0;
+        uint64_t l2e = ds_kread64(l2_kva + l2 * 8);
         if (!(l2e & 3)) return 0;
-        uint64_t pa = (l2e & 0x0000FFFFFFFFF000ULL) | (va & 0xFFF);
-        if ((pa & ~0xFFFULL) >= PE_MAX_PHYS_RAM) return 0;
-        return pa;
+        return (l2e & 0x0000FFFFFFFFF000ULL) | (va & 0xFFF);
 
     } else {
         // ---- 16KB: L1(12)→L2(11)→L3(11) ----
@@ -243,68 +253,65 @@ static uint64_t pe_va_to_pa(uint64_t va)
         uint64_t l2 = (va >> 25) & 0x7FF;
         uint64_t l3 = (va >> 14) & 0x7FF;
 
-        uint64_t l1_kva = gPhysBase + gGameTTBR0 + l1 * 8;
-        if (!pe_is_safe_kva(l1_kva)) return 0;
-        uint64_t l1e = ds_kread64(l1_kva);
+        uint64_t l1_kva = pe_pa_to_kva(gGameTTBR0);
+        if (!l1_kva) return 0;
+        uint64_t l1e = ds_kread64(l1_kva + l1 * 8);
         if (!(l1e & 3)) return 0;
         if (l1e & 2) {
-            uint64_t pa = (l1e & 0x0000FFFF80000000ULL) | (va & 0xFFFFFFFFFULL);
-            if ((pa & ~0x3FFFULL) >= PE_MAX_PHYS_RAM) return 0;
-            return pa;
+            return (l1e & 0x0000FFFF80000000ULL) | (va & 0xFFFFFFFFFULL);
         }
 
         uint64_t l2pa = l1e & 0x0000FFFFFFFFC000ULL;
         if (!l2pa) return 0;
-        uint64_t l2_kva = gPhysBase + l2pa + l2 * 8;
-        if (!pe_is_safe_kva(l2_kva)) return 0;
-        uint64_t l2e = ds_kread64(l2_kva);
+        uint64_t l2_kva = pe_pa_to_kva(l2pa);
+        if (!l2_kva) return 0;
+        uint64_t l2e = ds_kread64(l2_kva + l2 * 8);
         if (!(l2e & 3)) return 0;
         if (l2e & 2) {
-            uint64_t pa = (l2e & 0x0000FFFFFFFE0000ULL) | (va & 0x1FFFFFF);
-            if ((pa & ~0x3FFFULL) >= PE_MAX_PHYS_RAM) return 0;
-            return pa;
+            return (l2e & 0x0000FFFFFFFE0000ULL) | (va & 0x1FFFFFF);
         }
 
         uint64_t l3pa = l2e & 0x0000FFFFFFFFC000ULL;
         if (!l3pa) return 0;
-        uint64_t l3_kva = gPhysBase + l3pa + l3 * 8;
-        if (!pe_is_safe_kva(l3_kva)) return 0;
-        uint64_t l3e = ds_kread64(l3_kva);
+        uint64_t l3_kva = pe_pa_to_kva(l3pa);
+        if (!l3_kva) return 0;
+        uint64_t l3e = ds_kread64(l3_kva + l3 * 8);
         if (!(l3e & 3)) return 0;
-        uint64_t pa = (l3e & 0x0000FFFFFFFFC000ULL) | (va & 0x3FFF);
-        if ((pa & ~0x3FFFULL) >= PE_MAX_PHYS_RAM) return 0;
-        return pa;
+        return (l3e & 0x0000FFFFFFFFC000ULL) | (va & 0x3FFF);
     }
 }
 
-// ---- 内核读原语（边界检查 + 回退 0） ----
+// ---- 内核读原语（ptov_table 换算，失败回退 0，绝不 panic） ----
 static uint64_t kread64(uint64_t va) {
     uint64_t pa = pe_va_to_pa(va);
     if (!pa) return 0;
-    uint64_t kva = pa2kva(pa);
-    if (!pe_is_safe_kva(kva)) return 0;
+    uint64_t kva = pe_pa_to_kva(pa);
+    if (!kva) return 0;
     return ds_kread64(kva);
 }
 static uint32_t kread32(uint64_t va) {
     uint64_t pa = pe_va_to_pa(va);
     if (!pa) return 0;
-    uint64_t kva = pa2kva(pa);
-    if (!pe_is_safe_kva(kva)) return 0;
+    uint64_t kva = pe_pa_to_kva(pa);
+    if (!kva) return 0;
     return ds_kread32(kva);
 }
 static bool kreadbuf(uint64_t va, void *out, size_t sz) {
-    if (sz > 4096) return false;
+    if (sz > 4096 || gPageShift == 0) return false;
     uint64_t pa = pe_va_to_pa(va);
     if (!pa) return false;
-    uint64_t off = va & 0xFFF;
-    uint64_t kva = pa2kva(pa + off);
-    if (!pe_is_safe_kva(kva)) return false;
-    size_t avail = (size_t)((1ULL << gPageShift) - (size_t)off);
+    uint64_t kva = pe_pa_to_kva(pa); // pa 已含页内偏移
+    if (!kva) return false;
+
+    size_t pageMask = (size_t)((1ULL << gPageShift) - 1);
+    size_t off = (size_t)(va & pageMask);
+    size_t avail = ((size_t)1 << gPageShift) - off;
     if (avail < sz) {
+        // 跨页：第二段单独换算
         uint64_t pa2 = pe_va_to_pa(va + (uint64_t)avail);
         if (!pa2) return false;
-        uint64_t kva2 = pa2kva(pa2);
-        if (!pe_is_safe_kva(kva2)) return false;
+        uint64_t kva2 = pe_pa_to_kva(pa2);
+        if (!kva2) return false;
         ds_kread(kva, out, avail);
         ds_kread(kva2, (char *)out + avail, sz - avail);
         return true;
@@ -509,22 +516,26 @@ enum {
 
 static bool pe_init_game(void)
 {
-    pe_init_physmap();
-    if (!gPhysBase) { printf("[PE] physmap fail, game init aborted\n"); return false; }
+    pe_detect_page_size();
+    if (!pe_init_ptov()) {
+        printf("[PE] ptov_table 初始化失败，game init aborted（绝不探测，防内核 panic）\n");
+        return false;
+    }
     if (!pe_init_game_pmap()) return false;
 
     uint64_t probe = 0x100000000ULL;
     for (int i = 0; i < 20000; i++) {
         uint64_t pa = pe_va_to_pa(probe);
         if (pa) {
-            uint64_t kva = pa2kva(pa);
-            if (!pe_is_safe_kva(kva)) { probe += 0x4000; continue; }
-            uint32_t m = ds_kread32(kva);
-            if (m == 0xFEEDFACF || m == 0xCFFAEDFE) {
-                // 验证：Mach-O magic 落在可执行映像头部
-                gGameBase = probe;
-                printf("[PE] base=0x%llx iter=%d\n", gGameBase, i);
-                break;
+            uint64_t kva = pe_pa_to_kva(pa);
+            if (kva) {
+                uint32_t m = ds_kread32(kva);
+                if (m == 0xFEEDFACF || m == 0xCFFAEDFE) {
+                    // 验证：Mach-O magic 落在可执行映像头部
+                    gGameBase = probe;
+                    printf("[PE] base=0x%llx iter=%d\n", gGameBase, i);
+                    break;
+                }
             }
         }
         probe += 0x4000;
@@ -836,7 +847,7 @@ void PeaceESPStart(void) {
             }
 
             printf("[PE] === start (4KB/16KB adaptive) ===\n");
-            if (!pe_init_game()) { pe_fail(@"游戏初始化失败（physmap / 页表 / 基址扫描）。"); return; }
+            if (!pe_init_game()) { pe_fail(@"游戏初始化失败（ptov_table / 页表 / 基址扫描），详见控制台日志。"); return; }
 
             if (!pe_overlay_create()) {
                 pe_fail(@"SpringBoard Overlay 创建失败。");
