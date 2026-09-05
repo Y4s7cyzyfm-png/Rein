@@ -13,7 +13,7 @@
 @interface ConsoleLogViewController : UIViewController
 @property (nonatomic, strong) UITextView *textView;
 @property (nonatomic, strong) UILabel *countLabel;
-@property (nonatomic, strong) UIButton *copyButton;
+@property (nonatomic, strong) UIButton *logCopyButton;
 @property (nonatomic, strong) UIButton *clearButton;
 @property (nonatomic, copy) NSString *lastRenderedText;
 @property (nonatomic, strong) NSTimer *refreshTimer;
@@ -44,10 +44,10 @@
     self.countLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [header addSubview:self.countLabel];
 
-    self.copyButton = [self headerButtonWithTitle:@"复制"];
+    self.logCopyButton = [self headerButtonWithTitle:@"复制"];
     self.clearButton = [self headerButtonWithTitle:@"清空"];
     UIButton *doneButton = [self headerButtonWithTitle:@"完成"];
-    [header addSubview:self.copyButton];
+    [header addSubview:self.logCopyButton];
     [header addSubview:self.clearButton];
     [header addSubview:doneButton];
 
@@ -58,7 +58,8 @@
     self.textView.backgroundColor = [UIColor colorWithWhite:0.04 alpha:1.0];
     self.textView.textColor = [UIColor colorWithRed:0.55 green:0.88 blue:0.62 alpha:1.0];
     self.textView.font = ([UIFont fontWithName:@"Menlo-Regular" size:11]
-                          ?: [UIFont monospaceSystemFontOfSize:11 weight:UIFontWeightRegular]);
+                          ?: [UIFont fontWithName:@"Courier" size:11]
+                          ?: [UIFont systemFontOfSize:11]);
     self.textView.layer.cornerRadius = 12;
     self.textView.layer.masksToBounds = YES;
     self.textView.contentInset = UIEdgeInsetsMake(10, 6, 10, 6);
@@ -86,8 +87,8 @@
         [self.clearButton.trailingAnchor constraintEqualToAnchor:doneButton.leadingAnchor constant:-18],
         [self.clearButton.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
 
-        [self.copyButton.trailingAnchor constraintEqualToAnchor:self.clearButton.leadingAnchor constant:-18],
-        [self.copyButton.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
+        [self.logCopyButton.trailingAnchor constraintEqualToAnchor:self.clearButton.leadingAnchor constant:-18],
+        [self.logCopyButton.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
 
         [self.textView.topAnchor constraintEqualToAnchor:header.bottomAnchor constant:10],
         [self.textView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:12],
@@ -97,7 +98,7 @@
 
     [doneButton addTarget:self action:@selector(doneTapped)
          forControlEvents:UIControlEventTouchUpInside];
-    [self.copyButton addTarget:self action:@selector(copyTapped)
+    [self.logCopyButton addTarget:self action:@selector(copyTapped)
               forControlEvents:UIControlEventTouchUpInside];
     [self.clearButton addTarget:self action:@selector(clearTapped)
                forControlEvents:UIControlEventTouchUpInside];
@@ -162,10 +163,10 @@
 }
 
 - (void)flashButtonTitle:(NSString *)title {
-    [self.copyButton setTitle:title forState:UIControlStateNormal];
+    [self.logCopyButton setTitle:title forState:UIControlStateNormal];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        [self.copyButton setTitle:@"复制" forState:UIControlStateNormal];
+        [self.logCopyButton setTitle:@"复制" forState:UIControlStateNormal];
     });
 }
 
