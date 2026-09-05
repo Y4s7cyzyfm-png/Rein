@@ -861,8 +861,35 @@ static int pe_actors(PE_Enemy *out, int max) {
         uint64_t a = kread64(arr + (uint64_t)i * 8); if (!a) continue;
         if ((int)kread32(a + O_TEAM) == gMyTeam && gMyTeam != -1) continue;
         float hp; uint32_t hr = kread32(a + O_HP); memcpy(&hp, &hr, 4); if (hp <= 0) continue;
-        uint64_t rc = kread64(a + O_ROOTCOMP); if (!rc) continue;
-        PE_Vec3 loc; if (!kreadbuf(rc + O_LOC, &loc, sizeof(loc))) continue;
+        uint64_t rc = kread64(a + O_ROOTCOMP);
+        if (rc < 0x100000000ULL || rc >= 0x800000000ULL) {
+            if (gFailActors < 3) {
+                PE_LOG_ERROR("Actor坐标指针异常：actor=0x%llx +0x%x -> 0x%llx",
+                             (unsigned long long)a,
+                             O_ROOTCOMP,
+                             (unsigned long long)rc);
+                gFailActors++;
+            }
+            continue;
+        }
+        PE_Vec3 loc;
+        if (!kreadbuf(rc + O_LOC, &loc, sizeof(loc))) {
+            if (gFailActors < 3) {
+                PE_LOG_ERROR("Actor坐标读取失败：actor=0x%llx root=0x%llx locOff=0x%x",
+                             (unsigned long long)a,
+                             (unsigned long long)rc,
+                             O_LOC);
+                gFailActors++;
+            }
+            continue;
+        }
+        static int sCoordSampleLogged = 0; // 坐标采样打印限流（前 3 个，防 30fps 刷屏）
+        if (sCoordSampleLogged < 3) {
+            PE_LOG("Actor坐标：0x%llx -> (%.1f, %.1f, %.1f)",
+                   (unsigned long long)a,
+                   loc.x, loc.y, loc.z);
+            sCoordSampleLogged++;
+        }
         float dx = loc.x - gMyPos.x, dy = loc.y - gMyPos.y, dz = loc.z - gMyPos.z;
         float dist = sqrtf(dx * dx + dy * dy + dz * dz); if (dist > PE_FAR_CLIP) continue;
         PE_Enemy *e = &out[w];
@@ -1112,15 +1139,26 @@ static void peace_esp_tick(void) {
         PE_LOG("帧数据：敌人数=%d（0 且无报错 = Actor 过滤全灭，坐标/血量偏移可疑）", n);
         sLoggedCount++;
     }
+    int w2sVisible = 0;
+    int onscreen = 0;
     int vi = 0;
     PE_Rect zeroRect = {0, 0, 0, 0};
     for (int i = 0; i < n && vi < PE_MAX_ENEMIES; i++) {
         PE_Enemy *e = &es[i];
         PE_Vec2S tp = w2s(e->top, &cam, gSW, gSH);
         PE_Vec2S bt = w2s(e->bottom, &cam, gSW, gSH);
+
+        if (tp.visible && bt.visible) {
+            w2sVisible++;
+        }
+
         if (!tp.visible || !bt.visible) continue;
+
         float h = (float)fabs(bt.y - tp.y), w = h * 0.4f, x = tp.x - w * 0.5f, y = tp.y;
         if (x + w < 0 || x > gSW || y + h < 0 || y > gSH) continue;
+
+        onscreen++;
+
         PE_Rect boxRect = {x, y, (double)w, (double)h};
         pe_box(vi, boxRect, true);
         PE_Rect nameRect = {x - 10, y - 18, (double)w + 20, 16};
@@ -1137,6 +1175,15 @@ static void peace_esp_tick(void) {
         pe_lbl(gDist[i], nil, zeroRect, false);
     }
     gVis = vi;
+
+    // 绘制诊断：前 3 帧每帧打一次，之后约 5 秒采样一次（防 30fps 刷屏）
+    static int sDrawDiagLogged = 0;
+    if (sDrawDiagLogged < 3 || (gFrames % 150) == 0) {
+        PE_LOG("绘制诊断：actors=%d w2s=%d onscreen=%d visibleViews=%d",
+               n, w2sVisible, onscreen, gVis);
+    }
+    sDrawDiagLogged++;
+
     gFrames++;
 }
 
