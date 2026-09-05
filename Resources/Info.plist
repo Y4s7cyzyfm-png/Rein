@@ -24,6 +24,11 @@
 	<string>public.app-category.developer-tools</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<!-- 静音循环后台保活：RemoteCall 异常端口需要在后台继续应答 -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
 	<!-- Allow dropping the DarkSword kernelcache into this app via Finder/Files. -->
 	<key>UIFileSharingEnabled</key>
 	<true/>

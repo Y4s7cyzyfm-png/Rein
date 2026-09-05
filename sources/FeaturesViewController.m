@@ -8,6 +8,7 @@
 #import "MD3Components.h"
 #import "ReinBridge.h"
 #import "PeaceESP.h"
+#import "SilentKeepAlive.h"
 
 static NSString * const kFeatureKeyPrefix = @"rein.feature.";
 
@@ -18,6 +19,7 @@ static NSString * const kFeatureKeyPrefix = @"rein.feature.";
 @property (nonatomic, strong) UIView *toastView;
 @property (nonatomic, strong) UILabel *toastLabel;
 @property (nonatomic, strong) NSTimer *espStateTimer;
+@property (nonatomic, strong) MD3Switch *keepAliveSwitch;
 @property (nonatomic, copy, nullable) NSString *lastShownESPError;
 @property (nonatomic, assign) BOOL espStarting;
 @end
@@ -56,6 +58,7 @@ static NSString * const kFeatureKeyPrefix = @"rein.feature.";
     ]];
 
     [self buildReinFeatureButton];
+    [self buildKeepAliveCard];
     [self buildFeatureSwitches];
     [self buildToast];
 
@@ -105,6 +108,60 @@ static NSString * const kFeatureKeyPrefix = @"rein.feature.";
     } else if (!self.espStarting) {
         [self.reinFeatureButton setTitle:@"启动ESP"];
     }
+}
+
+/// 「后台保活」卡片：静音音频循环，退后台后 App 不被冻结，
+/// RemoteCall 异常端口得以继续应答（防 SpringBoard 注销）。
+- (void)buildKeepAliveCard {
+    MD3CardView *card = [[MD3CardView alloc] init];
+    [self.stack addArrangedSubview:card];
+
+    UILabel *title = [[UILabel alloc] init];
+    title.text = @"后台保活";
+    title.font = MD3Theme.titleFont;
+    title.textColor = MD3Theme.onSurfaceColor;
+    title.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:title];
+
+    UILabel *subtitle = [[UILabel alloc] init];
+    subtitle.text = @"静音音频循环，退后台保持运行（防注销）";
+    subtitle.font = MD3Theme.bodyFont;
+    subtitle.textColor = MD3Theme.onSurfaceColor;
+    subtitle.numberOfLines = 0;
+    subtitle.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:subtitle];
+
+    MD3Switch *keepAliveSwitch = [[MD3Switch alloc] init];
+    keepAliveSwitch.on = SilentKeepAlivePreferenceEnabled();
+    keepAliveSwitch.tag = 100;
+    [keepAliveSwitch addTarget:self action:@selector(keepAliveChanged:)
+               forControlEvents:UIControlEventValueChanged];
+    [card addSubview:keepAliveSwitch];
+    self.keepAliveSwitch = keepAliveSwitch;
+
+    [NSLayoutConstraint activateConstraints:@[
+        [title.topAnchor constraintEqualToAnchor:card.topAnchor constant:16],
+        [title.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+        [title.trailingAnchor constraintLessThanOrEqualToAnchor:keepAliveSwitch.leadingAnchor constant:-12],
+
+        [subtitle.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:4],
+        [subtitle.leadingAnchor constraintEqualToAnchor:title.leadingAnchor],
+        [subtitle.trailingAnchor constraintLessThanOrEqualToAnchor:keepAliveSwitch.leadingAnchor constant:-12],
+        [subtitle.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-16],
+
+        [keepAliveSwitch.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
+        [keepAliveSwitch.centerYAnchor constraintEqualToAnchor:card.centerYAnchor],
+    ]];
+
+    // 偏好已开启时补一次启动（冷启动后自动恢复播放）
+    if (SilentKeepAlivePreferenceEnabled()) {
+        SilentKeepAliveStart();
+    }
+}
+
+- (void)keepAliveChanged:(MD3Switch *)sender {
+    SilentKeepAliveSetPreference(sender.on);
+    [self showToast:sender.on ? @"后台保活已开启" : @"后台保活已关闭"];
 }
 
 - (void)buildFeatureSwitches {
