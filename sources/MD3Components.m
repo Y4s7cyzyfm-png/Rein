@@ -139,7 +139,11 @@
 @property (nonatomic, strong) NSLayoutConstraint *thumbCenterX;
 @end
 
-@implementation MD3Switch
+@implementation MD3Switch {
+    UIImpactFeedbackGenerator *_hapticGenerator;
+    BOOL _dragged;
+    CGFloat _touchStartLocationX;
+}
 
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
@@ -147,16 +151,24 @@
         self.translatesAutoresizingMaskIntoConstraints = NO;
         self.isAccessibilityElement = YES;
         self.accessibilityTraits = UIAccessibilityTraitButton;
+        _hapticGenerator = [[UIImpactFeedbackGenerator alloc]
+            initWithStyle:UIImpactFeedbackStyleLight];
 
+        // 轨道
         UIView *track = [[UIView alloc] init];
         track.translatesAutoresizingMaskIntoConstraints = NO;
         track.layer.cornerRadius = 16;
+        track.layer.cornerCurve = kCACornerCurveContinuous;
+        track.userInteractionEnabled = NO;
         [self addSubview:track];
         self.trackView = track;
 
+        // 滑块
         UIView *thumb = [[UIView alloc] init];
         thumb.translatesAutoresizingMaskIntoConstraints = NO;
         thumb.layer.cornerRadius = 12;
+        thumb.layer.cornerCurve = kCACornerCurveContinuous;
+        thumb.userInteractionEnabled = NO;
         [self addSubview:thumb];
         self.thumbView = thumb;
 
@@ -177,15 +189,55 @@
         [self.widthAnchor constraintEqualToConstant:52].active = YES;
         [self.heightAnchor constraintEqualToConstant:32].active = YES;
 
-        [self addTarget:self action:@selector(didTap)
-         forControlEvents:UIControlEventTouchUpInside];
         [self applyColorsAnimated:NO];
     }
     return self;
 }
 
-- (void)didTap {
-    self.on = !self.on;
+// 扩大点击热区到至少 44x44（HIG 最小可点按尺寸）
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    CGRect bounds = self.bounds;
+    CGFloat dx = MAX(0, (44.0 - bounds.size.width) / 2.0);
+    CGFloat dy = MAX(0, (44.0 - bounds.size.height) / 2.0);
+    CGRect hitArea = CGRectInset(bounds, -dx, -dy);
+    return CGRectContainsPoint(hitArea, point);
+}
+
+#pragma mark 触摸跟踪：单击切换 + 左右拖拽切换
+
+- (BOOL)beginTrackingWithTouch:(UITouch *)touch withEvent:(UIEvent *)event {
+    _touchStartLocationX = [touch locationInView:self].x;
+    _dragged = NO;
+    return YES;
+}
+
+- (BOOL)continueTrackingWithTouch:(UITouch *)touch withEvent:(UIEvent *)event {
+    CGFloat locationX = [touch locationInView:self].x;
+    CGFloat deltaX = locationX - _touchStartLocationX;
+    if (ABS(deltaX) >= 10.0) {
+        _dragged = YES;
+        BOOL on = deltaX > 0;
+        if (on != self.on) {
+            [self toggleTo:on];
+        }
+    }
+    return YES;
+}
+
+- (void)endTrackingWithTouch:(UITouch *)touch withEvent:(UIEvent *)event {
+    [super endTrackingWithTouch:touch withEvent:event];
+    if (_dragged) return;
+    [self toggleTo:!self.on];
+}
+
+- (void)cancelTrackingWithEvent:(UIEvent *)event {
+    [super cancelTrackingWithEvent:event];
+    _dragged = NO;
+}
+
+- (void)toggleTo:(BOOL)on {
+    [self setOn:on animated:YES];
+    [_hapticGenerator impactOccurred];
     [self sendActionsForControlEvents:UIControlEventValueChanged];
 }
 
