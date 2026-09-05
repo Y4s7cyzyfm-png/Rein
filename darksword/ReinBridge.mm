@@ -12,6 +12,7 @@
 
 #import <UIKit/UIKit.h>
 #import <notify.h>
+#import <os/lock.h>
 #import <os/log.h>
 
 #include <atomic>
