@@ -496,8 +496,8 @@ enum {
     O_CAMCACHE = 0x640, // Cache 条目指针（自相机；POV 在 Cache+0x28）
 
     // Actor / Pawn 字段（安卓 SDK 对照表，iOS 同源）
-    O_ROOTCOMP  = 0x260,  // 坐标1（RootComponent 指针）
-    O_LOC       = 0x200,  // 坐标2：RootComponent 内 vec3（安卓表 0x1f0）
+    O_ROOTCOMP  = 0x260,  // 坐标1（RootComponent 指针）不动
+    O_LOC       = 0x200,  // 坐标2：RootComponent 内 vec3（安卓表 0x1f0）不动
     O_NAME      = 0xAF8,  // 玩家名字（FString）
     O_UID       = 0xB20,  // 玩家 UID
     O_PLAYERDATA= 0x5F0,  // 玩家数据指针
@@ -517,8 +517,8 @@ enum {
     O_BONEARRAY = 0x1D0,  // 骨骼阵列
     O_BONEPTR   = 0x838,  // 骨骼指针
 
-    // 关卡 / Actor 数组（沿用旧值，本次未提供新数据）
-    O_PERSISTLEVEL = 0xB0, O_ACTORS = 0xA0, O_ACTORCNT = 0xA8,
+    // 关卡 / Actor 数组（沿用旧值，本次未提供新数据）不动
+    O_PERSISTLEVEL = 0xB8, O_ACTORS = 0xA0, O_ACTORCNT = 0xA8,
 
     // ---- 以下为 2026-09 新增功能偏移（已录入，功能逐步接入） ----
 
