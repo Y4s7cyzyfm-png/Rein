@@ -2,9 +2,8 @@
 //  PeaceESP.mm
 //  Rein
 //
-//  v6-safe：自适应 4KB/16KB 页面；PA→KVA 一律经内核官方 ptov_table 换算
-//  （由 libxpf 从 kernelcache 解析符号，读取仅触及内核 data 段，安全），
-//  绝不探测任意 KVA——探测会触发 copy_validate_kernel_addr 内核 panic。
+//  v7：游戏内存改经 TaskRop 的 vmmapremotepage（vm_object 共享内存映射）
+//  读取——不再走 ptov_table / pmap 页表遍历（iOS 18.6 上两者语义均与预期不符）。
 //  远程 ObjC 调用层移植自 DarkSpeed 的 DSBridge（NSInvocation on SB main thread）。
 //
 
@@ -27,7 +26,19 @@ extern "C" {
 #import "darksword.h"
 #import "utils.h"
 #import "offsets.h"
-#import "xpf.h"
+
+// TaskRop/vm.h 的接口（vm.m 为 C 链接；完整 vm.h 含 ObjC @interface，不整体引入）。
+// vmmapremotepage：把目标进程 vm_map 里某页所属的 vm_object 经引用计数 +
+// 本地 memory entry 替换，映射进本进程地址空间——无需 ptov/页表遍历。
+struct vmshmem {
+    uint64_t port;
+    uint64_t remoteAddress;
+    uint64_t localAddress;
+    bool     used;
+};
+struct vmshmem vmmapremotepage(uint64_t vmMap, uint64_t address);
+void vmmapiterateentries(uint64_t vmmaptptr, void (^itblock)(uint64_t start, uint64_t end, uint64_t entry, BOOL *stop));
+kern_return_t mach_vm_deallocate(vm_map_t target, mach_vm_address_t address, mach_vm_size_t size);
 }
 
 // ============================================================
@@ -103,9 +114,9 @@ static void pe_detail(NSString *detail) {
 #define PE_FAR_CLIP          40000.0f
 #define PE_PLAYER_HEIGHT     175.0f
 
-// XNU ptov_table：32 条目，每条覆盖 64GB 物理地址段（PTOV_SHIFT = 36）
-#define PE_PTOV_SIZE  32
-#define PE_PTOV_SHIFT 36
+// 远程页缓存（开放寻址哈希；容量 2 的幂）
+#define PE_PAGE_CACHE_CAP 512
+#define PE_PAGE_NCACHE_CAP 256
 
 // ============================================================
 // 基础类型
@@ -136,38 +147,21 @@ static uint64_t gFrames = 0, gGameBase = 0;
 static PE_Vec3  gMyPos = {0};
 
 // ============================================================
-// 内核内存读取基础设施（ptov_table + 页表）
+// 游戏内存读取基础设施（vm_object 映射 + 远程页缓存）
 // ============================================================
 
-static uint64_t gGameTTBR0 = 0;          // 游戏进程页表基址（PA，即 pmap->ttep）
-static uint64_t gGameL1KVA = 0;          // 游戏 L1 页表内核虚地址（即 pmap->tte）
+static uint64_t gGameVMMap = 0;         // 游戏 vm_map（内核地址）
 static int      gPageShift = 0;          // 12=4KB, 14=16KB
-static uint64_t gPtovTable[PE_PTOV_SIZE]; // XNU ptov_table 缓存
-static bool     gPtovReady = false;
-static int      gPtovShift = 0;          // 已验证的 ptov 索引位移（0=未验证，回退标准 36）
-static int      gPtovIdxAdd = 0;         // 已验证的索引附加值（+1 = 表基址偏 8 字节）
 
-// ---- 按指定公式做 PA → KVA（只经 ptov_table 换算，无映射即失败） ----
-// 绝不探测任意内核地址：ds_kread 对非法 KVA 会触发
-// copy_validate_kernel_addr 内核 panic（真机已验证）。
-static uint64_t pe_ptov_kva_raw(uint64_t pa, int shift, int idxAdd) {
-    if (!gPtovReady) return 0;
-    uint64_t idx = ((pa >> shift) & (PE_PTOV_SIZE - 1)) + (uint64_t)idxAdd;
-    if (idx >= PE_PTOV_SIZE) return 0;
-    uint64_t off = gPtovTable[idx];
-    if (!off) return 0; // 该物理段无 physmap 映射
-    uint64_t kva = off + pa;
-    if (!ds_isvalid(kva)) return 0;
-    // offsets 机制解析出的内核 VA 布局边界（xpf "translation" set）
-    if (VM_MIN_KERNEL_ADDRESS != 0 && kva < VM_MIN_KERNEL_ADDRESS) return 0;
-    if (VM_MAX_KERNEL_ADDRESS != 0 && kva > VM_MAX_KERNEL_ADDRESS) return 0;
-    return kva;
-}
+typedef struct {
+    uint64_t remotePage; // 远程页基址（key；0 = 空槽）
+    uint64_t localPage;  // 本地映射基址（value）
+} PEPageSlot;
 
-static uint64_t pe_pa_to_kva(uint64_t pa) {
-    if (gPtovShift != 0) return pe_ptov_kva_raw(pa, gPtovShift, gPtovIdxAdd);
-    return pe_ptov_kva_raw(pa, PE_PTOV_SHIFT, 0);
-}
+static PEPageSlot gPageCache[PE_PAGE_CACHE_CAP];
+static int  gPageCacheCount = 0;
+static uint64_t gPageNeg[PE_PAGE_NCACHE_CAP]; // 近期映射失败的页（负缓存）
+static int  gMapFailLogged = 0;
 
 // ---- 检测页大小 ----
 static void pe_detect_page_size(void)
@@ -182,312 +176,125 @@ static void pe_detect_page_size(void)
     PE_LOG("page_size=%d shift=%d", 1 << gPageShift, gPageShift);
 }
 
-// ---- 解析 ptov_table 符号并缓存映射表 ----
-// 符号经 libxpf 从 Documents/kernelcache 解析（只解析不运行），
-// 表本体位于内核 __data 段，ds_kread 读取安全。
-static bool pe_init_ptov(void)
-{
-    if (gPtovReady) return true;
+// ---- 游戏内存读取层（vm_object 共享内存映射 + 页缓存） ----
+// vmmapremotepage 会遍历游戏 vm_map 找到地址所属 entry 的 vm_object，
+// 把该对象映射进本进程（并把失败结果缓存，避免坏指针反复全表遍历）。
 
-    NSString *docs = NSSearchPathForDirectoriesInDomains(
-        NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-    NSString *kc = docs.length ? [docs stringByAppendingPathComponent:@"kernelcache"] : nil;
-    if (!kc || ![[NSFileManager defaultManager] fileExistsAtPath:kc]) {
-        PE_LOG_ERROR("kernelcache 不存在（path=%{public}@），无法解析 ptov_table", kc);
-        pe_detail(@"Documents 下未找到 kernelcache（请先在「内核」页初始化 DarkSword 内核）");
-        return false;
-    }
-
-    if (xpf_start_with_kernel_path(kc.UTF8String) != 0) {
-        const char *err = xpf_get_error();
-        PE_LOG_ERROR("xpf start 失败: %{public}s", err ? err : "(null)");
-        pe_detail([NSString stringWithFormat:@"xpf 解析 kernelcache 失败：%s",
-                   err ? err : "unknown"]);
-        return false;
-    }
-    uint64_t sym = xpf_item_resolve("kernelSymbol.ptov_table");
-    uint64_t fileBase = gXPF.kernelBase;
-    xpf_stop();
-
-    if (!sym || !fileBase || sym < fileBase) {
-        PE_LOG_ERROR("ptov_table 符号解析失败（sym=0x%llx fileBase=0x%llx）",
-                     (unsigned long long)sym, (unsigned long long)fileBase);
-        pe_detail([NSString stringWithFormat:@"ptov_table 符号解析失败（sym=0x%llx fileBase=0x%llx）",
-                   (unsigned long long)sym, (unsigned long long)fileBase]);
-        return false;
-    }
-
-    uint64_t runtime = sym - fileBase + ds_get_kernel_base();
-    PE_LOG("ptov_table: sym=0x%llx runtime=0x%llx",
-           (unsigned long long)sym, (unsigned long long)runtime);
-
-    uint64_t table[PE_PTOV_SIZE];
-    memset(table, 0, sizeof(table));
-    ds_kread(runtime, table, sizeof(table));
-
-    int valid = 0;
-    for (int i = 0; i < PE_PTOV_SIZE; i++) {
-        gPtovTable[i] = table[i];
-        if (table[i]) valid++;
-    }
-    if (valid == 0) {
-        PE_LOG_ERROR("ptov_table 全零（runtime=0x%llx），无法建立 PA→KVA 映射",
-                     (unsigned long long)runtime);
-        pe_detail(@"ptov_table 读取结果全零，无法建立 PA→KVA 映射");
-        return false;
-    }
-
-    gPtovReady = true;
-    PE_LOG("ptov_table 就绪（%d 个映射段）", valid);
-    for (int i = 0; i < PE_PTOV_SIZE; i++) {
-        if (gPtovTable[i]) {
-            PE_LOG("  seg[%d] off=0x%llx → VA base=0x%llx",
-                   i, (unsigned long long)gPtovTable[i],
-                   (unsigned long long)(gPtovTable[i] + ((uint64_t)i << PE_PTOV_SHIFT)));
-        }
-    }
-    return true;
+static uint64_t pe_page_size(void) {
+    return (uint64_t)1 << (gPageShift ? gPageShift : 14);
 }
 
-// ---- 游戏 pmap → TTBR0 ----
-static bool pe_init_game_pmap(void)
-{
-    uint64_t proc = procbyname(PE_GAME_PROCESS);
-    if (!proc) {
-        PE_LOG_ERROR("procbyname 未找到 %{public}s", PE_GAME_PROCESS);
-        pe_detail(@"procbyname 未找到游戏进程 ShadowTrackerExtra");
-        return false;
-    }
-    PE_LOG("proc=0x%llx", (unsigned long long)proc);
-    uint64_t task = proc_task(proc);
-    if (!task) {
-        PE_LOG_ERROR("proc_task 取不到 task（proc=0x%llx）", (unsigned long long)proc);
-        pe_detail([NSString stringWithFormat:@"proc_task 取不到 task（proc=0x%llx）",
-                   (unsigned long long)proc]);
-        return false;
-    }
-
-    // vm_map：直接用 DarkSword offsets（off_task_map，随内核版本解析），
-    // 比按指针范围扫描可靠——本机内核堆指针为 0xffffffe0-0xffffffe7 段，
-    // 旧的 >0xFFFFFFF0 判定会全部漏掉（真机日志已证实）
-    uint64_t vmmap = task_get_vm_map(task);
-    if (!ds_isvalid(vmmap)) {
-        PE_LOG_ERROR("task_get_vm_map 取不到 vm_map（task=0x%llx off_task_map=0x%x）",
-                     (unsigned long long)task, off_task_map);
-        pe_detail([NSString stringWithFormat:@"task_get_vm_map 取不到 vm_map（task=0x%llx）",
-                   (unsigned long long)task]);
-        return false;
-    }
-    PE_LOG("vm_map=0x%llx (off_task_map=0x%x)", (unsigned long long)vmmap, off_task_map);
-
-    // pmap 候选：vm_map 前部字段里的内核指针（去重，最多 4 个）
-    uint64_t pmapCand[4];
-    int nMap = 0;
-    for (int off = 0x10; off <= 0x70 && nMap < 4; off += 8) {
-        uint64_t val = ds_kreadptr(vmmap + off);
-        if (ds_isvalid(val) && val != vmmap) {
-            bool dup = false;
-            for (int i = 0; i < nMap; i++) if (pmapCand[i] == val) dup = true;
-            if (!dup) pmapCand[nMap++] = val;
+// 整体回收：解除全部本地映射并清空正/负缓存（ESP 重启、周期防陈旧时调用）
+static void pe_page_cache_flush(void) {
+    uint64_t ps = pe_page_size();
+    for (int i = 0; i < PE_PAGE_CACHE_CAP; i++) {
+        if (gPageCache[i].remotePage) {
+            mach_vm_deallocate(mach_task_self(),
+                               (mach_vm_address_t)gPageCache[i].localPage, ps);
+            gPageCache[i].remotePage = 0;
         }
     }
-    if (nMap == 0) {
-        PE_LOG_ERROR("vm_map+0x10..0x70 未扫描到 pmap 候选（vm_map=0x%llx）",
-                     (unsigned long long)vmmap);
-        pe_detail([NSString stringWithFormat:@"vm_map+0x10..0x70 未扫描到 pmap 候选（vm_map=0x%llx）",
-                   (unsigned long long)vmmap]);
-        return false;
+    gPageCacheCount = 0;
+    memset(gPageNeg, 0, sizeof(gPageNeg));
+    gMapFailLogged = 0;
+}
+
+static bool pe_page_is_bad(uint64_t page) {
+    uint64_t mask = PE_PAGE_NCACHE_CAP - 1;
+    uint64_t h = (page >> 14) & mask;
+    for (uint64_t i = 0; i < PE_PAGE_NCACHE_CAP; i++) {
+        uint64_t v = gPageNeg[(h + i) & mask];
+        if (v == page) return true;
+        if (v == 0) return false;
     }
-
-    // iOS 18 的 ptov_table 条目语义与经典 (pa>>36)+delta 存在差异（实测
-    // seg[0] 基址不是内核 VA）。这里用 pmap 里的 (ttep PA, tte KVA) 对现场
-    // 验证公式：正确公式满足 ptov(ttep) == tte，且 tte 指向的 L1[0] 是有效
-    // 描述符（游戏用户空间 VA 全部落在 L1[0] 覆盖范围内）。读取仅触及
-    // 结构体内真实指针，不做任意地址探测，防内核 panic。
-    static const struct { int shift; int add; } kPtovFormulas[] = {
-        {36, 0},  // 经典 XNU：phystokv(pa) = ptov[pa>>36] + pa
-        {36, 1},  // 符号偏 8 字节（表前多算一条）
-        {35, 0},  // 位移 35
-        {34, 0},  // 位移 34
-        {33, 0},  // 位移 33
-    };
-    const size_t kNumFormulas = sizeof(kPtovFormulas) / sizeof(kPtovFormulas[0]);
-    uint64_t pageMask = (1ULL << (gPageShift ? gPageShift : 14)) - 1;
-
-    for (int m = 0; m < nMap; m++) {
-        uint64_t pmap = pmapCand[m];
-
-        // ttep 候选（PA）：32 位视图按 ppnum 展开（<<12/<<14）+ 64 位视图原值
-        uint64_t paCand[24];
-        int nPa = 0;
-        // tte 候选（内核 VA）：页对齐的内核指针
-        uint64_t vaCand[8];
-        int nVa = 0;
-
-        for (int off = 0x8; off < 0x60; off += 8) {
-            uint32_t v32 = ds_kread32(pmap + off);
-            uint64_t v64 = ds_kreadptr(pmap + off);
-            if (nPa < 24) {
-                uint64_t cands[3] = {
-                    (uint64_t)v32, (uint64_t)v32 << 12, (uint64_t)v32 << 14,
-                };
-                for (int c = 0; c < 3 && nPa < 24; c++) {
-                    if (cands[c] >= 0x40000000ULL && cands[c] < 0x1000000000ULL &&
-                        (cands[c] & pageMask) == 0) {
-                        paCand[nPa++] = cands[c];
-                    }
-                }
-                if (nPa < 24 && v64 >= 0x40000000ULL && v64 < 0x1000000000ULL &&
-                    (v64 & pageMask) == 0) {
-                    paCand[nPa++] = v64;
-                }
-            }
-            if (nVa < 8 && (v64 >> 44) != 0 && (v64 & pageMask) == 0 &&
-                ds_isvalid(v64) &&
-                (VM_MIN_KERNEL_ADDRESS == 0 || v64 >= VM_MIN_KERNEL_ADDRESS) &&
-                (VM_MAX_KERNEL_ADDRESS == 0 || v64 <= VM_MAX_KERNEL_ADDRESS)) {
-                vaCand[nVa++] = v64;
-            }
-        }
-
-        // 匹配：tte 的 L1[0] 须为有效描述符，且存在 (ttep, 公式) 使 ptov(ttep)==tte
-        for (int a = 0; a < nVa; a++) {
-            uint64_t tte = vaCand[a];
-            uint64_t l1e0 = ds_kread64(tte); // 结构体内真实内核指针，读取安全
-            if (!(l1e0 & 1)) continue;       // L1[0] 须为有效描述符
-            for (int p = 0; p < nPa; p++) {
-                uint64_t ttep = paCand[p];
-                for (size_t f = 0; f < kNumFormulas; f++) {
-                    if (pe_ptov_kva_raw(ttep, kPtovFormulas[f].shift,
-                                        kPtovFormulas[f].add) != tte) {
-                        continue;
-                    }
-                    gGameTTBR0 = ttep;
-                    gGameL1KVA = tte;
-                    gPtovShift = kPtovFormulas[f].shift;
-                    gPtovIdxAdd = kPtovFormulas[f].add;
-                    PE_LOG("pmap=0x%llx（vm_map 候选 #%d）", (unsigned long long)pmap, m);
-                    PE_LOG("TTBR0(ttep)=0x%llx tte(L1 KVA)=0x%llx L1[0]=0x%llx",
-                           (unsigned long long)ttep, (unsigned long long)tte,
-                           (unsigned long long)l1e0);
-                    PE_LOG("ptov 公式验证成功：shift=%d idxAdd=%d（ptov(ttep)==tte）",
-                           kPtovFormulas[f].shift, kPtovFormulas[f].add);
-                    return true;
-                }
-            }
-        }
-    }
-
-    PE_LOG_ERROR("pmap 候选（%d 个）中未验证出 (ttep,tte,ptov公式) 三元组，请把控制台日志发回分析", nMap);
-    pe_detail(@"未能在 pmap 中验证页表三元组（ttep/tte/ptov 公式），候选详见控制台日志");
     return false;
 }
 
-// ---- 安全 VA → PA（自适应 4KB/16KB，全部经 ptov_table 换算） ----
-static uint64_t pe_va_to_pa(uint64_t va)
-{
-    if (gPageShift == 0) return 0;
-    // L1 根表：优先用已验证的 tte（内核 VA）；否则经 ptov 换算 ttep
-    uint64_t l1root = gGameL1KVA ? gGameL1KVA : pe_pa_to_kva(gGameTTBR0);
-    if (!l1root) return 0;
+static void pe_page_mark_bad(uint64_t page) {
+    uint64_t mask = PE_PAGE_NCACHE_CAP - 1;
+    uint64_t h = (page >> 14) & mask;
+    for (uint64_t i = 0; i < PE_PAGE_NCACHE_CAP; i++) {
+        uint64_t slot = (h + i) & mask;
+        if (gPageNeg[slot] == page) return;
+        if (gPageNeg[slot] == 0) { gPageNeg[slot] = page; return; }
+    }
+    gPageNeg[h] = page; // 满则覆盖首个槽
+}
 
-    if (gPageShift == 12) {
-        // ---- 4KB: L0(9)→L1(9)→L2(9) ----
-        uint64_t l0 = (va >> 30) & 0x1FF;
-        uint64_t l1 = (va >> 21) & 0x1FF;
-        uint64_t l2 = (va >> 12) & 0x1FF;
+static uint64_t pe_page_cache_get(uint64_t remotePage) {
+    uint64_t mask = PE_PAGE_CACHE_CAP - 1;
+    uint64_t h = (remotePage >> 14) & mask;
+    for (uint64_t i = 0; i < PE_PAGE_CACHE_CAP; i++) {
+        PEPageSlot *s = &gPageCache[(h + i) & mask];
+        if (s->remotePage == remotePage) return s->localPage;
+        if (s->remotePage == 0) break;
+    }
+    return 0;
+}
 
-        uint64_t l0_kva = l1root;
-        uint64_t l0e = ds_kread64(l0_kva + l0 * 8);
-        if (!(l0e & 3)) return 0;
-        if (l0e & 2) return (l0e & 0x0000FFFFC0000000ULL) | (va & 0x3FFFFFFF);
-
-        uint64_t l1pa = l0e & 0x0000FFFFFFFFF000ULL;
-        if (!l1pa) return 0;
-        uint64_t l1_kva = pe_pa_to_kva(l1pa);
-        if (!l1_kva) return 0;
-        uint64_t l1e = ds_kread64(l1_kva + l1 * 8);
-        if (!(l1e & 3)) return 0;
-        if (l1e & 2) return (l1e & 0x0000FFFFFE000000ULL) | (va & 0x1FFFFF);
-
-        uint64_t l2pa = l1e & 0x0000FFFFFFFFF000ULL;
-        if (!l2pa) return 0;
-        uint64_t l2_kva = pe_pa_to_kva(l2pa);
-        if (!l2_kva) return 0;
-        uint64_t l2e = ds_kread64(l2_kva + l2 * 8);
-        if (!(l2e & 3)) return 0;
-        return (l2e & 0x0000FFFFFFFFF000ULL) | (va & 0xFFF);
-
-    } else {
-        // ---- 16KB: L1(12)→L2(11)→L3(11) ----
-        uint64_t l1 = (va >> 36) & 0xFFF;
-        uint64_t l2 = (va >> 25) & 0x7FF;
-        uint64_t l3 = (va >> 14) & 0x7FF;
-
-        uint64_t l1_kva = l1root;
-        uint64_t l1e = ds_kread64(l1_kva + l1 * 8);
-        if (!(l1e & 3)) return 0;
-        if (l1e & 2) {
-            return (l1e & 0x0000FFFF80000000ULL) | (va & 0xFFFFFFFFFULL);
+static void pe_page_cache_put(uint64_t remotePage, uint64_t localPage) {
+    if (gPageCacheCount >= PE_PAGE_CACHE_CAP) {
+        PE_LOG("页缓存满（%d），整体回收", gPageCacheCount);
+        pe_page_cache_flush();
+    }
+    uint64_t mask = PE_PAGE_CACHE_CAP - 1;
+    uint64_t h = (remotePage >> 14) & mask;
+    for (uint64_t i = 0; i < PE_PAGE_CACHE_CAP; i++) {
+        PEPageSlot *s = &gPageCache[(h + i) & mask];
+        if (s->remotePage == remotePage) { s->localPage = localPage; return; }
+        if (s->remotePage == 0) {
+            s->remotePage = remotePage;
+            s->localPage = localPage;
+            gPageCacheCount++;
+            return;
         }
-
-        uint64_t l2pa = l1e & 0x0000FFFFFFFFC000ULL;
-        if (!l2pa) return 0;
-        uint64_t l2_kva = pe_pa_to_kva(l2pa);
-        if (!l2_kva) return 0;
-        uint64_t l2e = ds_kread64(l2_kva + l2 * 8);
-        if (!(l2e & 3)) return 0;
-        if (l2e & 2) {
-            return (l2e & 0x0000FFFFFFFE0000ULL) | (va & 0x1FFFFFF);
-        }
-
-        uint64_t l3pa = l2e & 0x0000FFFFFFFFC000ULL;
-        if (!l3pa) return 0;
-        uint64_t l3_kva = pe_pa_to_kva(l3pa);
-        if (!l3_kva) return 0;
-        uint64_t l3e = ds_kread64(l3_kva + l3 * 8);
-        if (!(l3e & 3)) return 0;
-        return (l3e & 0x0000FFFFFFFFC000ULL) | (va & 0x3FFF);
     }
 }
 
-// ---- 内核读原语（ptov_table 换算，失败回退 0，绝不 panic） ----
+static uint64_t pe_map_remote_page(uint64_t remotePage) {
+    uint64_t local = pe_page_cache_get(remotePage);
+    if (local) return local;
+    if (pe_page_is_bad(remotePage)) return 0;
+
+    struct vmshmem sh = vmmapremotepage(gGameVMMap, remotePage);
+    if (!sh.used || !sh.localAddress) {
+        if (gMapFailLogged < 3) { // 坏指针常见，只记前几次防刷屏
+            PE_LOG_ERROR("映射远程页失败 page=0x%llx",
+                         (unsigned long long)remotePage);
+            gMapFailLogged++;
+        }
+        pe_page_mark_bad(remotePage);
+        return 0;
+    }
+    pe_page_cache_put(remotePage, sh.localAddress);
+    return sh.localPage;
+}
+
+// ---- 内核读原语（远程页映射，失败回退 0，绝不 panic） ----
+static bool kreadbuf(uint64_t va, void *out, size_t sz) {
+    if (sz == 0 || gPageShift == 0 || sz > pe_page_size()) return false;
+    uint64_t ps = pe_page_size();
+    uint64_t page = va & ~(ps - 1);
+    uint64_t off = va - page;
+    if (off + sz > ps) { // 跨页：分段映射
+        size_t first = (size_t)(ps - off);
+        return kreadbuf(va, out, first) &&
+               kreadbuf(va + first, (char *)out + first, sz - first);
+    }
+    uint64_t local = pe_map_remote_page(page);
+    if (!local) return false;
+    memcpy(out, (const void *)(local + off), sz);
+    return true;
+}
 static uint64_t kread64(uint64_t va) {
-    uint64_t pa = pe_va_to_pa(va);
-    if (!pa) return 0;
-    uint64_t kva = pe_pa_to_kva(pa);
-    if (!kva) return 0;
-    return ds_kread64(kva);
+    uint64_t v = 0;
+    kreadbuf(va, &v, sizeof(v));
+    return v;
 }
 static uint32_t kread32(uint64_t va) {
-    uint64_t pa = pe_va_to_pa(va);
-    if (!pa) return 0;
-    uint64_t kva = pe_pa_to_kva(pa);
-    if (!kva) return 0;
-    return ds_kread32(kva);
-}
-static bool kreadbuf(uint64_t va, void *out, size_t sz) {
-    if (sz > 4096 || gPageShift == 0) return false;
-    uint64_t pa = pe_va_to_pa(va);
-    if (!pa) return false;
-    uint64_t kva = pe_pa_to_kva(pa); // pa 已含页内偏移
-    if (!kva) return false;
-
-    size_t pageMask = (size_t)((1ULL << gPageShift) - 1);
-    size_t off = (size_t)(va & pageMask);
-    size_t avail = ((size_t)1 << gPageShift) - off;
-    if (avail < sz) {
-        // 跨页：第二段单独换算
-        uint64_t pa2 = pe_va_to_pa(va + (uint64_t)avail);
-        if (!pa2) return false;
-        uint64_t kva2 = pe_pa_to_kva(pa2);
-        if (!kva2) return false;
-        ds_kread(kva, out, avail);
-        ds_kread(kva2, (char *)out + avail, sz - avail);
-        return true;
-    }
-    ds_kread(kva, out, sz);
-    return true;
+    uint32_t v = 0;
+    kreadbuf(va, &v, sizeof(v));
+    return v;
 }
 
 // ============================================================
@@ -684,6 +491,46 @@ enum {
 // 第 1 层：游戏内存
 // ============================================================
 
+// 遍历游戏 vm_map 条目定位主映像基址：
+// 在 [0x100000000, 0x800000000) 窗口内（共享缓存之下的 app 映像区），
+// 优先检查大段（≥16MB，UE4 主映像 __TEXT 量级）的首页 Mach-O magic。
+static bool pe_find_game_base(void)
+{
+    struct { uint64_t start, end; } cand[24];
+    __block int n = 0;
+    vmmapiterateentries(gGameVMMap, ^(uint64_t start, uint64_t end,
+                                      uint64_t entry, BOOL *stop) {
+        if (n >= 24) { *stop = YES; return; }
+        if (start < 0x100000000ULL || start >= 0x800000000ULL) return;
+        if (end - start < 0x4000ULL) return;
+        cand[n].start = start;
+        cand[n].end = end;
+        n++;
+    });
+    PE_LOG("vm_map 窗口内候选条目 %d 个", n);
+
+    for (int pass = 0; pass < 2 && !gGameBase; pass++) {
+        uint64_t minSize = (pass == 0) ? 0x1000000ULL : 0x4000ULL;
+        for (int i = 0; i < n; i++) {
+            if (cand[i].end - cand[i].start < minSize) continue;
+            uint32_t magic = 0;
+            if (!kreadbuf(cand[i].start, &magic, sizeof(magic))) continue;
+            if (magic == 0xFEEDFACF || magic == 0xCFFAEDFE) {
+                gGameBase = cand[i].start;
+                PE_LOG("base=0x%llx（条目 #%d 区间 [0x%llx,0x%llx) 首页命中 Mach-O）",
+                       (unsigned long long)gGameBase, i,
+                       (unsigned long long)cand[i].start,
+                       (unsigned long long)cand[i].end);
+                return true;
+            }
+        }
+    }
+
+    PE_LOG_ERROR("窗口内 %d 个条目均未命中 Mach-O 头，请把控制台日志发回分析", n);
+    pe_detail(@"未在游戏 vm_map 条目中找到 Mach-O 主映像（详见控制台日志）");
+    return false;
+}
+
 static bool pe_init_game(void)
 {
     pe_detect_page_size();
@@ -691,39 +538,43 @@ static bool pe_init_game(void)
            (unsigned long long)ds_get_kernel_base(),
            (unsigned long long)VM_MIN_KERNEL_ADDRESS,
            (unsigned long long)VM_MAX_KERNEL_ADDRESS);
-    if (!pe_init_ptov()) {
-        PE_LOG_ERROR("ptov_table 初始化失败，game init aborted（绝不探测，防内核 panic）");
+
+    uint64_t proc = procbyname(PE_GAME_PROCESS);
+    if (!proc) {
+        PE_LOG_ERROR("procbyname 未找到 %{public}s", PE_GAME_PROCESS);
+        pe_detail(@"procbyname 未找到游戏进程 ShadowTrackerExtra");
         return false;
     }
-    if (!pe_init_game_pmap()) return false;
+    PE_LOG("proc=0x%llx", (unsigned long long)proc);
+    uint64_t task = proc_task(proc);
+    if (!task) {
+        PE_LOG_ERROR("proc_task 取不到 task（proc=0x%llx）", (unsigned long long)proc);
+        pe_detail([NSString stringWithFormat:@"proc_task 取不到 task（proc=0x%llx）",
+                   (unsigned long long)proc]);
+        return false;
+    }
 
-    uint64_t probe = 0x100000000ULL;
-    for (int i = 0; i < 20000; i++) {
-        uint64_t pa = pe_va_to_pa(probe);
-        if (pa) {
-            uint64_t kva = pe_pa_to_kva(pa);
-            if (kva) {
-                uint32_t m = ds_kread32(kva);
-                if (m == 0xFEEDFACF || m == 0xCFFAEDFE) {
-                    // 验证：Mach-O magic 落在可执行映像头部
-                    gGameBase = probe;
-                    PE_LOG("base=0x%llx iter=%d", (unsigned long long)gGameBase, i);
-                    break;
-                }
-            }
-        }
-        probe += 0x4000;
+    // vm_map：DarkSword offsets（off_task_map，随内核版本解析）
+    gGameVMMap = task_get_vm_map(task);
+    if (!ds_isvalid(gGameVMMap)) {
+        PE_LOG_ERROR("task_get_vm_map 取不到 vm_map（task=0x%llx off_task_map=0x%x）",
+                     (unsigned long long)task, off_task_map);
+        pe_detail([NSString stringWithFormat:@"task_get_vm_map 取不到 vm_map（task=0x%llx）",
+                   (unsigned long long)task]);
+        return false;
     }
-    if (!gGameBase) {
-        gGameBase = 0x100000000ULL;
-        PE_LOG_ERROR("基址扫描未命中 Mach-O 头（0x100000000 起 20000 页），回退默认基址 0x100000000，GWorld 读取可能无效");
-    }
-    uint64_t gw = kread64(gGameBase + O_GWORLD);
-    PE_LOG("GWorld=0x%llx", (unsigned long long)gw);
-    gGameOK = (gw > 0x100000000ULL && gw < 0x800000000ULL);
+    PE_LOG("vm_map=0x%llx (off_task_map=0x%x)",
+           (unsigned long long)gGameVMMap, off_task_map);
+
+    pe_page_cache_flush();
+    if (!pe_find_game_base()) return false;
+
+    uint64_t gworld = kread64(gGameBase + O_GWORLD);
+    PE_LOG("GWorld=0x%llx", (unsigned long long)gworld);
+    gGameOK = (gworld > 0x100000000ULL && gworld < 0x800000000ULL);
     if (!gGameOK) {
         PE_LOG_ERROR("GWorld=0x%llx 不在预期范围，ESP 可能无数据——游戏版本偏移可能需要更新",
-                     (unsigned long long)gw);
+                     (unsigned long long)gworld);
     }
     return true;
 }
@@ -973,8 +824,17 @@ static void pe_lbl(uint64_t lb, NSString *text, PE_Rect r, bool v) {
 // 第 5 层：帧
 // ============================================================
 
+static int gFlushCounter = 0;
+
 static void peace_esp_tick(void) {
     if (!gOverlayReady || !gRun || !gGameOK) return;
+
+    // 周期回收远程页缓存：防游戏换图/重映射后读到陈旧对象（对象被我们
+    // 引用计数保活，内容不再更新）。约 5 秒一次，重建代价一次性的。
+    if (++gFlushCounter >= 150) {
+        gFlushCounter = 0;
+        pe_page_cache_flush();
+    }
 
     if (!pe_myinfo()) return;
     float vp[16]; if (!pe_vp(vp)) return;
@@ -1049,7 +909,7 @@ void PeaceESPStart(void) {
 
             PE_LOG("=== start (4KB/16KB adaptive) ===（Console.app 过滤 subsystem: com.rein.peaceesp）");
             if (!pe_init_game()) {
-                pe_fail(@"游戏初始化失败（ptov_table / 页表 / 基址扫描），详细日志见 Console.app（subsystem: com.rein.peaceesp）。");
+                pe_fail(@"游戏初始化失败（vm_map / 基址扫描），详细日志见 Console.app（subsystem: com.rein.peaceesp）。");
                 return;
             }
 
@@ -1068,6 +928,8 @@ void PeaceESPStart(void) {
                 usleep((useconds_t)(PE_DEFAULT_INTERVAL * 1000000.0));
             }
             pe_overlay_destroy();
+            pe_page_cache_flush();
+            gGameVMMap = 0;
             gRun = false;
             gThreadDone = true;
             PE_LOG("loop exit");
