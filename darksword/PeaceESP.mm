@@ -164,6 +164,9 @@ static int  gPageCacheCount = 0;
 static uint64_t gPageNeg[PE_PAGE_NCACHE_CAP]; // 近期映射失败的页（负缓存）
 static int  gMapFailLogged = 0;
 
+// 帧循环环节诊断计数（限流：每种失败只记前 3 次，防 30fps 刷屏）
+static int gFailMyinfo = 0, gFailVp = 0, gFailActors = 0;
+
 // ---- 检测页大小 ----
 static void pe_detect_page_size(void)
 {
@@ -490,22 +493,24 @@ enum {
 
     // 相机（PC → 相机指针 0x680 → CameraCache/POV 沿用旧值，待验证）
     O_CAMPTR  = 0x680,  // 相机指针（自 PC）
-    O_CAMCACHE = 0x640, O_POV = 0x13A0,
+    O_CAMCACHE = 0x640, // Cache 条目指针（自相机；POV 在 Cache+0x28）
 
-    // Actor / Pawn 字段
-    O_ROOTCOMP  = 0x260,  // 坐标指针
-    O_LOC       = 0x200,  // RootComponent 内坐标（沿用旧值）
+    // Actor / Pawn 字段（安卓 SDK 对照表，iOS 同源）
+    O_ROOTCOMP  = 0x260,  // 坐标1（RootComponent 指针）
+    O_LOC       = 0x1F0,  // 坐标2：RootComponent 内 vec3（安卓表 0x1f0）
     O_NAME      = 0xAF8,  // 玩家名字（FString）
     O_UID       = 0xB20,  // 玩家 UID
     O_PLAYERDATA= 0x5F0,  // 玩家数据指针
     O_ISREAL    = 0xB50,  // 是否真人
     O_TEAM      = 0xB78,  // 队伍编号
-    O_AI        = 0xB94,  // 人机识别
+    O_AI        = 0xB94,  // 人机判断
+    O_ADV_AI    = 0xB9C,  // 高级人机判断
     O_HP        = 0x1060, // 当前血量
     O_HPMAX     = 0x1068, // 最大血量
-    O_ACTION    = 0x1700, // 人物动作
-    O_DEFSPEED  = 0x10BC, // 默认速度值
-    O_CURSPEED  = 0x10C0, // 当前速度值
+    O_ACTION    = 0x1700, // 人物状态
+    O_RANK1     = 0x3334, // 一称判断
+    O_HEIGHT    = 0x10C0, // 人物高度
+    O_CROSSHAIR_ID = 0x3B9C, // 人物过滤/判断
 
     // 骨骼（预留，骨骼 ESP 用）
     O_MESHARRAY = 0x658,  // 阵列偏移
@@ -520,14 +525,15 @@ enum {
     // 击杀信息（对象地址 → 击杀指针 0x2988 → 击杀数量 0x2C；含击杀者/受害者名字）
     O_KILLLIST = 0x2988, O_KILLCOUNT = 0x2C,
 
-    // 载具（对象地址 → 载具指针 0xC00 → 状态 0x1FD0 / 油量 0x218 / 血量 0x1F4）
-    O_VEHICLE = 0xC00, O_VEHSTATE = 0x1FD0, O_VEHFUEL = 0x218, O_VEHHP = 0x1F4,
+    // 载具（对象地址 → 载具指针 0xC00 → 耐久/油量；ID 0x20B0）
+    O_VEHICLE = 0xC00, O_VEHID = 0x20B0,
+    O_VEHHP = 0x1F8, O_VEHHPMAX = 0x1F4, O_VEHFUEL = 0x21C, O_VEHFUELMAX = 0x218,
 
-    // 准星（准星指针 0x5E8；X 0x600；Y 按原表为 0x5E8）
-    O_CROSSHAIRPTR = 0x5E8, O_CROSSX = 0x600, O_CROSSY = 0x5E8,
+    // 准星（准星X 0x600 / 准星Y 0x604）
+    O_CROSSX = 0x600, O_CROSSY = 0x604,
 
-    // 开火 / 开镜判断（对象地址）
-    O_FIRING = 0x1848, O_SCOPED = 0x2750,
+    // 开火 / 开镜判断（对象地址；安卓表：开火 0x2750，开镜 0x1848）
+    O_FIRING = 0x2750, O_SCOPED = 0x1848,
 
     // 投掷物（组件 0x33B0 → 配置 0x130 → 更多配置 0x8 → 手雷爆炸时间 0x88C）
     O_THROWCOMP = 0x33B0, O_THROWCONF = 0x130, O_THROWMORE = 0x8, O_GRENADEFUSE = 0x88C,
@@ -698,9 +704,7 @@ static bool pe_init_game(void)
 
 static uint64_t gw(void) { return gGameOK ? kread64(gGameBase + O_GWORLD) : 0; }
 
-// ---- 帧循环环节诊断（限流：每种失败只记前 3 次，防 30fps 刷屏） ----
-static int gFailMyinfo = 0, gFailVp = 0, gFailActors = 0;
-
+// ---- 帧循环环节诊断 ----
 static bool pe_myinfo(void) {
     uint64_t g = gw(); if (!g) return false;
     // 自身链：GWorld → +0xC0 → +0x88 → +0x30（PlayerController）→ +0x3540（Pawn）
@@ -741,45 +745,67 @@ static bool pe_myinfo(void) {
     return true;
 }
 
-static bool pe_vp(float out[16]) {
+// 相机 POV（安卓表：Fov1 0x60C8 / Fov2 0x680 / Fov3[+0x40] 0x640）
+// 链：GWorld → 0xC0 → 0x88 → 0x30（PC）→ +0x680（相机）→ +0x640（Cache 条目）
+// POV（FMinimalViewInfo）落在 Cache+0x28：Location +0x28，Rotation +0x34，FOV +0x40
+typedef struct {
+    PE_Vec3 loc;   // 相机位置
+    PE_Vec3 rot;   // 旋转（Pitch / Yaw / Roll，度）
+    float   fov;   // FOV（度）
+} PECamera;
+
+static bool pe_vp(PECamera *cam) {
     uint64_t g = gw(); if (!g) return false;
-    // PC 同自身链前三级，再走 相机指针(0x680) → CameraCache → POV
     uint64_t a   = kread64(g + O_SELF2);
     uint64_t b   = a ? kread64(a + O_SELF3) : 0;
     uint64_t pc  = b ? kread64(b + O_SELF4) : 0;
-    uint64_t cam = pc ? kread64(pc + O_CAMPTR) : 0;
-    uint64_t cc  = cam ? kread64(cam + O_CAMCACHE) : 0;
-    if (!cc || cc < 0x100000000ULL || cc >= 0x800000000ULL) {
+    uint64_t camPtr = pc ? kread64(pc + O_CAMPTR) : 0;
+    uint64_t cache  = camPtr ? kread64(camPtr + O_CAMCACHE) : 0;
+    if (!cache || cache < 0x100000000ULL || cache >= 0x800000000ULL) {
         if (gFailVp < 3) {
             PE_LOG_ERROR("相机链断链：GWorld=0x%llx +0x%x→0x%llx +0x%x→0x%llx +0x%x→0x%llx "
-                         "+0x%x(相机指针)→0x%llx +0x%x(CameraCache)→0x%llx",
+                         "+0x%x(相机)→0x%llx +0x%x(Cache)→0x%llx",
                          (unsigned long long)g, O_SELF2, (unsigned long long)a,
                          O_SELF3, (unsigned long long)b,
                          O_SELF4, (unsigned long long)pc,
-                         O_CAMPTR, (unsigned long long)cam,
-                         O_CAMCACHE, (unsigned long long)cc);
+                         O_CAMPTR, (unsigned long long)camPtr,
+                         O_CAMCACHE, (unsigned long long)cache);
             gFailVp++;
         }
         return false;
     }
-    uint64_t pov = cc + O_POV;
-    if (!kreadbuf(pov + 0x1A0, out, 64)) {
+    // POV：loc/rot/fov 一次读完（含头 0x28 = 40 字节 + 28 = 68 字节，同页内）
+    unsigned char buf[68];
+    if (!kreadbuf(cache + 0x28, buf, sizeof(buf))) {
         if (gFailVp < 3) {
-            PE_LOG_ERROR("视图矩阵读取失败：CameraCache=0x%llx +0x%x +0x1A0（POV/矩阵偏移可能过期）",
-                         (unsigned long long)cc, O_POV);
+            PE_LOG_ERROR("POV 读取失败：Cache=0x%llx +0x28（POV 布局可能不符）",
+                         (unsigned long long)cache);
             gFailVp++;
         }
         return false;
     }
-    if (out[12] == 0 && out[13] == 0 && out[14] == 0 && out[15] == 0) {
+    memcpy(&cam->loc, buf, 12);
+    memcpy(&cam->rot, buf + 0xC, 12);
+    memcpy(&cam->fov, buf + 0x18, 4);
+    // 合理性校验：FOV 10..170，位置在用户态量级
+    if (cam->fov < 10.0f || cam->fov > 170.0f ||
+        fabsf(cam->loc.x) > 1e7f || fabsf(cam->loc.y) > 1e7f || fabsf(cam->loc.z) > 1e7f) {
         if (gFailVp < 3) {
-            PE_LOG_ERROR("视图矩阵全零：CameraCache=0x%llx +0x%x +0x1A0 处非矩阵（偏移过期）",
-                         (unsigned long long)cc, O_POV);
+            PE_LOG_ERROR("POV 数据可疑：Cache=0x%llx loc=(%.1f,%.1f,%.1f) rot=(%.1f,%.1f,%.1f) fov=%.1f"
+                         "（POV 起点可能不是 0x28，把此日志发回分析）",
+                         (unsigned long long)cache,
+                         cam->loc.x, cam->loc.y, cam->loc.z,
+                         cam->rot.x, cam->rot.y, cam->rot.z, cam->fov);
             gFailVp++;
         }
         return false;
     }
-    gFailVp = 0;
+    if (gFailVp == 0) { // 首次成功打一遍，便于核对
+        PE_LOG("相机就绪：loc=(%.1f,%.1f,%.1f) rot=(%.1f,%.1f,%.1f) fov=%.1f",
+               cam->loc.x, cam->loc.y, cam->loc.z,
+               cam->rot.x, cam->rot.y, cam->rot.z, cam->fov);
+        gFailVp = 1; // 防重复打印（0 是“未打印”哨兵）
+    }
     return true;
 }
 
@@ -845,13 +871,32 @@ static int pe_actors(PE_Enemy *out, int max) {
 // 第 2 层：WorldToScreen
 // ============================================================
 
-static PE_Vec2S w2s(PE_Vec3 w, const float vp[16], double sw, double sh) {
+// WorldToScreen：UE4 旋转（度）+ FOV 投影
+// forward=(cp·cy, cp·sy, sp)，right=(sy,−cy,0)，up=right×forward（Roll 忽略，一般为 0）
+static PE_Vec2S w2s(PE_Vec3 w, const PECamera *cam, double sw, double sh) {
     PE_Vec2S r = {0, 0, false};
-    float w4 = vp[3] * w.x + vp[7] * w.y + vp[11] * w.z + vp[15];
-    if (w4 < 0.01f) return r;
-    r.x = (float)((vp[0] * w.x + vp[4] * w.y + vp[8] * w.z + vp[12]) / w4 * 0.5 + 0.5) * (float)sw;
-    r.y = (float)(1.0 - (vp[1] * w.x + vp[5] * w.y + vp[9] * w.z + vp[13]) / w4 * 0.5) * (float)sh;
-    r.visible = true; return r;
+    float pitch = cam->rot.x * (float)M_PI / 180.0f;
+    float yaw   = cam->rot.y * (float)M_PI / 180.0f;
+    float cp = cosf(pitch), sp = sinf(pitch), cy = cosf(yaw), sy = sinf(yaw);
+
+    float fx = cp * cy, fy = cp * sy, fz = sp;          // forward
+    float rx = sy,     ry = -cy,    rz = 0.0f;          // right
+    float ux = ry * fz - rz * fy;                       // up = right × forward
+    float uy = rz * fx - rx * fz;
+    float uz = rx * fy - ry * fx;
+
+    float dx = w.x - cam->loc.x, dy = w.y - cam->loc.y, dz = w.z - cam->loc.z;
+    float xf = dx * fx + dy * fy + dz * fz;             // 前向距离
+    if (xf < 1.0f) return r;                            // 背后
+    float xr = dx * rx + dy * ry + dz * rz;
+    float xu = dx * ux + dy * uy + dz * uz;
+
+    float halfTan = tanf(cam->fov * (float)M_PI / 360.0f); // tan(fov/2)
+    if (halfTan < 0.01f) return r;
+    r.x = (float)(sw * 0.5 + (double)(xr / xf) / halfTan * sw * 0.5);
+    r.y = (float)(sh * 0.5 - (double)(xu / xf) / halfTan * sw * 0.5); // 同宽高比
+    r.visible = true;
+    return r;
 }
 
 // ============================================================
@@ -1042,17 +1087,22 @@ static void peace_esp_tick(void) {
     }
 
     if (!pe_myinfo()) return;
-    float vp[16]; if (!pe_vp(vp)) return;
+    PECamera cam; if (!pe_vp(&cam)) return;
 
     PE_Enemy es[PE_MAX_ENEMIES];
     for (int i = 0; i < PE_MAX_ENEMIES; i++) es[i].name = nil;
     int n = pe_actors(es, PE_MAX_ENEMIES);
+    static int sLoggedCount = 0; // 首帧打一次敌人数，便于确认 Actor 列表是否可用
+    if (sLoggedCount < 3) {
+        PE_LOG("帧数据：敌人数=%d（0 且无报错 = Actor 过滤全灭，坐标/血量偏移可疑）", n);
+        sLoggedCount++;
+    }
     int vi = 0;
     PE_Rect zeroRect = {0, 0, 0, 0};
     for (int i = 0; i < n && vi < PE_MAX_ENEMIES; i++) {
         PE_Enemy *e = &es[i];
-        PE_Vec2S tp = w2s(e->top, vp, gSW, gSH);
-        PE_Vec2S bt = w2s(e->bottom, vp, gSW, gSH);
+        PE_Vec2S tp = w2s(e->top, &cam, gSW, gSH);
+        PE_Vec2S bt = w2s(e->bottom, &cam, gSW, gSH);
         if (!tp.visible || !bt.visible) continue;
         float h = (float)fabs(bt.y - tp.y), w = h * 0.4f, x = tp.x - w * 0.5f, y = tp.y;
         if (x + w < 0 || x > gSW || y + h < 0 || y > gSH) continue;
