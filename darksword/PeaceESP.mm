@@ -756,18 +756,26 @@ typedef struct {
 
 static bool pe_vp(PECamera *cam) {
     uint64_t g = gw(); if (!g) return false;
-    uint64_t a   = kread64(g + O_SELF2);
-    uint64_t b   = a ? kread64(a + O_SELF3) : 0;
-    uint64_t pc  = b ? kread64(b + O_SELF4) : 0;
+    // 相机链（按安卓表）：
+    //   GWorld +0xC0 → +0x88 → +0x30（三级对象）→ +0x3540（自身 Pawn）
+    //   Pawn +0x60C8（玩家控制器，见“掩体判断”区）→ +0x680（相机）→ +0x640（Cache 条目）
+    //   POV 落在 Cache+0x28：Location/Rotation/FOV（FOV 正好落在 +0x40，与表 Fov3[+0x40] 吻合）
+    uint64_t a    = kread64(g + O_SELF2);
+    uint64_t b    = a ? kread64(a + O_SELF3) : 0;
+    uint64_t c    = b ? kread64(b + O_SELF4) : 0;
+    uint64_t pawn = c ? kread64(c + O_SELF5) : 0;
+    uint64_t pc   = pawn ? kread64(pawn + O_PC_FROM_PAWN) : 0;
     uint64_t camPtr = pc ? kread64(pc + O_CAMPTR) : 0;
     uint64_t cache  = camPtr ? kread64(camPtr + O_CAMCACHE) : 0;
     if (!cache || cache < 0x100000000ULL || cache >= 0x800000000ULL) {
         if (gFailVp < 3) {
             PE_LOG_ERROR("相机链断链：GWorld=0x%llx +0x%x→0x%llx +0x%x→0x%llx +0x%x→0x%llx "
-                         "+0x%x(相机)→0x%llx +0x%x(Cache)→0x%llx",
+                         "+0x%x(Pawn)→0x%llx +0x%x(PC)→0x%llx +0x%x(相机)→0x%llx +0x%x(Cache)→0x%llx",
                          (unsigned long long)g, O_SELF2, (unsigned long long)a,
                          O_SELF3, (unsigned long long)b,
-                         O_SELF4, (unsigned long long)pc,
+                         O_SELF4, (unsigned long long)c,
+                         O_SELF5, (unsigned long long)pawn,
+                         O_PC_FROM_PAWN, (unsigned long long)pc,
                          O_CAMPTR, (unsigned long long)camPtr,
                          O_CAMCACHE, (unsigned long long)cache);
             gFailVp++;
@@ -927,8 +935,12 @@ static void pe_overlay_destroy(void) {
 
 static bool pe_overlay_create(void) {
     CGRect sb = UIScreen.mainScreen.bounds;
-    gSW = sb.size.width; gSH = sb.size.height;
-    PE_LOG("screen %dx%d", (int)gSW, (int)gSH);
+    // 游戏为横屏；本 App 竖屏时 mainScreen.bounds 也是竖屏（428x926），
+    // 但游戏画面/相机投影是 926x428——统一按横屏建 Overlay（宽=长边）。
+    gSW = MAX(sb.size.width, sb.size.height);
+    gSH = MIN(sb.size.width, sb.size.height);
+    PE_LOG("screen %dx%d（横屏；原始 bounds=%.0fx%.0f）",
+           (int)gSW, (int)gSH, sb.size.width, sb.size.height);
 
     uint64_t windowClass = pe_class("UIWindow");
     uint64_t viewClass = pe_class("UIView");
