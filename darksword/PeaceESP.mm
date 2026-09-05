@@ -267,7 +267,7 @@ static uint64_t pe_map_remote_page(uint64_t remotePage) {
         return 0;
     }
     pe_page_cache_put(remotePage, sh.localAddress);
-    return sh.localPage;
+    return sh.localAddress;
 }
 
 // ---- 内核读原语（远程页映射，失败回退 0，绝不 panic） ----
@@ -496,7 +496,10 @@ enum {
 // 优先检查大段（≥16MB，UE4 主映像 __TEXT 量级）的首页 Mach-O magic。
 static bool pe_find_game_base(void)
 {
-    struct { uint64_t start, end; } cand[24];
+    // block 按值捕获 C 数组且为只读——用堆缓冲区 + 指针捕获
+    typedef struct { uint64_t start, end; } PEMapCand;
+    PEMapCand *cand = (PEMapCand *)calloc(24, sizeof(PEMapCand));
+    if (!cand) return false;
     __block int n = 0;
     vmmapiterateentries(gGameVMMap, ^(uint64_t start, uint64_t end,
                                       uint64_t entry, BOOL *stop) {
@@ -509,6 +512,7 @@ static bool pe_find_game_base(void)
     });
     PE_LOG("vm_map 窗口内候选条目 %d 个", n);
 
+    bool found = false;
     for (int pass = 0; pass < 2 && !gGameBase; pass++) {
         uint64_t minSize = (pass == 0) ? 0x1000000ULL : 0x4000ULL;
         for (int i = 0; i < n; i++) {
@@ -521,10 +525,13 @@ static bool pe_find_game_base(void)
                        (unsigned long long)gGameBase, i,
                        (unsigned long long)cand[i].start,
                        (unsigned long long)cand[i].end);
-                return true;
+                found = true;
+                break;
             }
         }
     }
+    free(cand);
+    if (found) return true;
 
     PE_LOG_ERROR("窗口内 %d 个条目均未命中 Mach-O 头，请把控制台日志发回分析", n);
     pe_detail(@"未在游戏 vm_map 条目中找到 Mach-O 主映像（详见控制台日志）");
