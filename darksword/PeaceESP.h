@@ -18,6 +18,10 @@ OBJC_EXTERN void PeaceESPStart(void);
 /// 停止 ESP 并移除 SpringBoard 中的 Overlay。
 OBJC_EXTERN void PeaceESPStop(void);
 
+/// 阻塞等待 ESP 完全收尾（帧循环退出 + Overlay 已移除）。
+/// timeout 秒内收尾返回 YES，超时返回 NO。未运行时立即返回 YES。
+OBJC_EXTERN BOOL PeaceESPWaitFullyStopped(NSTimeInterval timeout);
+
 /// ESP 是否正在运行（Overlay 已建立且帧循环存活）。
 OBJC_EXTERN BOOL PeaceESPIsRunning(void);
 

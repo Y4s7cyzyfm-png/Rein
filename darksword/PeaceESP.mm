@@ -1194,6 +1194,12 @@ void PeaceESPStart(void) {
             PE_LOG("running");
             while (gRun && gOverlayReady) {
                 @autoreleasepool {
+                    // 会话被拆除/出错（trojanMem 失效）时立即退出，
+                    // 避免空转并对已死会话反复发起远程调用
+                    if (!gRC.trojanMem) {
+                        PE_LOG_ERROR("RemoteCall 会话已失效，停止 ESP");
+                        break;
+                    }
                     peace_esp_tick();
                 }
                 usleep((useconds_t)(PE_DEFAULT_INTERVAL * 1000000.0));
@@ -1212,6 +1218,14 @@ void PeaceESPStop(void) {
     gRun = false;
     // 等帧循环退出并移除 Overlay（最多 ~2s）
     for (int i = 0; i < 200 && !gThreadDone; i++) usleep(10000);
+}
+
+BOOL PeaceESPWaitFullyStopped(NSTimeInterval timeout) {
+    if (gThreadDone) return YES;
+    int iterations = (int)(timeout * 200.0); // 5ms 步进
+    if (iterations < 1) iterations = 1;
+    for (int i = 0; i < iterations && !gThreadDone; i++) usleep(5000);
+    return gThreadDone;
 }
 
 BOOL PeaceESPIsRunning(void) {

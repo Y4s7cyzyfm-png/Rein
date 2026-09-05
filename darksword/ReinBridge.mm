@@ -9,6 +9,7 @@
 
 #import "ReinBridge.h"
 #import "DSRemoteCall.h"
+#import "PeaceESP.h"
 
 #import <UIKit/UIKit.h>
 #import <notify.h>
@@ -18,6 +19,7 @@
 #include <atomic>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 // Vendored DarkSword headers are plain C / Objective-C.
 extern "C" {
@@ -557,6 +559,32 @@ void ReinInitializeRemoteCall(void) {
 
 RemoteCall *ReinBridgeRemoteCall(void) {
     return g_springBoard;
+}
+
+void ReinTeardownRemoteCall(void) {
+    // 先让 ESP 帧循环收尾（移除 Overlay 依赖远程调用，可能需要若干秒），
+    // 再在 bridge 串行队列上销毁 RemoteCall —— 顺序不能反：
+    // 端口销毁后仍挂在飞远程调用会把 SpringBoard 打崩（“注销”）。
+    dispatch_async(rein_bridge_queue(), ^{
+        @autoreleasepool {
+            // 停帧循环并等 Overlay 从 SpringBoard 移除完毕（含在飞的远程调用）
+            PeaceESPStop();
+            PeaceESPWaitFullyStopped(20.0);
+            @try {
+                RemoteCall *process = g_springBoard;
+                g_springBoard = nil;
+                g_remoteReady.store(false);
+                g_remotePID = 0;
+                rein_set_stage(@"RemoteCall 已断开");
+                rein_post_progress();
+                [process destroyRemoteCall]; // 幂等：多次调用 / dealloc 均安全
+                RB_LOG("RemoteCall session torn down");
+            } @catch (NSException *exception) {
+                rein_set_error([NSString stringWithFormat:@"RemoteCall 拆除异常：%@", exception.reason]);
+                rein_post_progress();
+            }
+        }
+    });
 }
 
 BOOL ReinReadGameProcess(int *outPid) {

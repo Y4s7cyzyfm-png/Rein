@@ -50,6 +50,11 @@ OBJC_EXTERN void ReinInitializeRemoteCall(void);
 /// (NULL until "初始化 RemoteCall" succeeded). Do not destroy it.
 OBJC_EXTERN RemoteCall * _Nullable ReinBridgeRemoteCall(void);
 
+/// 主动安全拆除 RemoteCall 会话：先等 ESP 帧循环退出，再销毁远程线程与
+/// 异常端口。退后台 / App 退出前必须调用，否则挂起的 trojan 线程会把
+/// SpringBoard 打崩（表现为“注销”）。异步执行（bridge 串行队列）。
+OBJC_EXTERN void ReinTeardownRemoteCall(void);
+
 /// Button "读取游戏进程": locate ShadowTrackerExtra via kernel proc walk.
 /// Requires the kernel to be ready. Synchronous (fast). Returns the pid.
 OBJC_EXTERN BOOL ReinReadGameProcess(int * _Nullable outPid);
