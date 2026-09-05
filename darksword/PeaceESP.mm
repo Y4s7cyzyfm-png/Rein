@@ -488,8 +488,9 @@ enum {
     // 自身链（GWorld 起，五级指针 → 自身 Pawn）
     O_SELF2 = 0xC0, O_SELF3 = 0x88, O_SELF4 = 0x30, O_SELF5 = 0x3540,
 
-    // 相机（PlayerController 起；CameraManager/CameraCache/POV 沿用旧值）
-    O_CAMMGR = 0x658, O_CAMCACHE = 0x640, O_POV = 0x13A0,
+    // 相机（PC → 相机指针 0x680 → CameraCache/POV 沿用旧值，待验证）
+    O_CAMPTR  = 0x680,  // 相机指针（自 PC）
+    O_CAMCACHE = 0x640, O_POV = 0x13A0,
 
     // Actor / Pawn 字段
     O_ROOTCOMP  = 0x260,  // 坐标指针
@@ -513,6 +514,33 @@ enum {
 
     // 关卡 / Actor 数组（沿用旧值，本次未提供新数据）
     O_PERSISTLEVEL = 0xB0, O_ACTORS = 0xA0, O_ACTORCNT = 0xA8,
+
+    // ---- 以下为 2026-09 新增功能偏移（已录入，功能逐步接入） ----
+
+    // 击杀信息（对象地址 → 击杀指针 0x2988 → 击杀数量 0x2C；含击杀者/受害者名字）
+    O_KILLLIST = 0x2988, O_KILLCOUNT = 0x2C,
+
+    // 载具（对象地址 → 载具指针 0xC00 → 状态 0x1FD0 / 油量 0x218 / 血量 0x1F4）
+    O_VEHICLE = 0xC00, O_VEHSTATE = 0x1FD0, O_VEHFUEL = 0x218, O_VEHHP = 0x1F4,
+
+    // 准星（准星指针 0x5E8；X 0x600；Y 按原表为 0x5E8）
+    O_CROSSHAIRPTR = 0x5E8, O_CROSSX = 0x600, O_CROSSY = 0x5E8,
+
+    // 开火 / 开镜判断（对象地址）
+    O_FIRING = 0x1848, O_SCOPED = 0x2750,
+
+    // 投掷物（组件 0x33B0 → 配置 0x130 → 更多配置 0x8 → 手雷爆炸时间 0x88C）
+    O_THROWCOMP = 0x33B0, O_THROWCONF = 0x130, O_THROWMORE = 0x8, O_GRENADEFUSE = 0x88C,
+
+    // 手持武器（武器指针 0x37A0 → [武器实体 0x2048] → 当前武器 0x990 → 手持 0xDD0）
+    O_WEAPTR = 0x37A0, O_WEAPENTITY = 0x2048, O_CURWEAP = 0x990, O_HOLDWEAP = 0xDD0,
+    O_CURAMMO = 0x2058, O_MAXAMMO = 0x205C, O_BARRELBULLET = 0x2068, O_BULLETSPEED = 0x15D4,
+
+    // 无后座（自身 → 0x1170 → 0xC80 → 无后X 0x1ED8 / 无后Y 0x1EE4）
+    O_NR1 = 0x1170, O_NR2 = 0xC80, O_NR_X = 0x1ED8, O_NR_Y = 0x1EE4,
+
+    // 掩体判断（自身 → 玩家控制器 0x60C8 → 相机指针 0x680；调用 Controller.LineOfSightTo）
+    O_PC_FROM_PAWN = 0x60C8,
 };
 
 // ============================================================
@@ -655,6 +683,7 @@ static bool pe_init_game(void)
            (unsigned long long)gGameVMMap, off_task_map);
 
     pe_page_cache_flush();
+    gFailMyinfo = 0; gFailVp = 0; gFailActors = 0;
     if (!pe_find_game_base()) return false;
 
     uint64_t gworld = kread64(gGameBase + O_GWORLD);
@@ -669,33 +698,88 @@ static bool pe_init_game(void)
 
 static uint64_t gw(void) { return gGameOK ? kread64(gGameBase + O_GWORLD) : 0; }
 
-static uint64_t chain(uint64_t base, const uint64_t *offs, int n) {
-    uint64_t a = base;
-    for (int i = 0; i < n; i++) {
-        if (!a) return 0;
-        a = kread64(a + offs[i]);
-    }
-    return a;
-}
+// ---- 帧循环环节诊断（限流：每种失败只记前 3 次，防 30fps 刷屏） ----
+static int gFailMyinfo = 0, gFailVp = 0, gFailActors = 0;
 
 static bool pe_myinfo(void) {
     uint64_t g = gw(); if (!g) return false;
     // 自身链：GWorld → +0xC0 → +0x88 → +0x30（PlayerController）→ +0x3540（Pawn）
-    uint64_t ch[] = {O_SELF2, O_SELF3, O_SELF4, O_SELF5};
-    uint64_t pawn = chain(g, ch, 4); if (!pawn) return false;
+    uint64_t a   = kread64(g + O_SELF2);
+    uint64_t b   = a ? kread64(a + O_SELF3) : 0;
+    uint64_t pc  = b ? kread64(b + O_SELF4) : 0;
+    uint64_t pawn = pc ? kread64(pc + O_SELF5) : 0;
+    if (!pawn || pawn < 0x100000000ULL || pawn >= 0x800000000ULL) {
+        if (gFailMyinfo < 3) {
+            PE_LOG_ERROR("自身链断链：GWorld=0x%llx +0x%x→0x%llx +0x%x→0x%llx +0x%x→0x%llx +0x%x→0x%llx",
+                         (unsigned long long)g, O_SELF2, (unsigned long long)a,
+                         O_SELF3, (unsigned long long)b,
+                         O_SELF4, (unsigned long long)pc,
+                         O_SELF5, (unsigned long long)pawn);
+            gFailMyinfo++;
+        }
+        return false;
+    }
     gMyTeam = (int)kread32(pawn + O_TEAM);
-    uint64_t rc = kread64(pawn + O_ROOTCOMP); if (!rc) return false;
-    return kreadbuf(rc + O_LOC, &gMyPos, sizeof(gMyPos));
+    uint64_t rc = kread64(pawn + O_ROOTCOMP);
+    if (!rc || rc < 0x100000000ULL || rc >= 0x800000000ULL) {
+        if (gFailMyinfo < 3) {
+            PE_LOG_ERROR("坐标指针无效：pawn=0x%llx +0x%x→0x%llx",
+                         (unsigned long long)pawn, O_ROOTCOMP, (unsigned long long)rc);
+            gFailMyinfo++;
+        }
+        return false;
+    }
+    if (!kreadbuf(rc + O_LOC, &gMyPos, sizeof(gMyPos))) {
+        if (gFailMyinfo < 3) {
+            PE_LOG_ERROR("自身坐标读取失败：RootComp=0x%llx +0x%x（O_LOC 可能过期）",
+                         (unsigned long long)rc, O_LOC);
+            gFailMyinfo++;
+        }
+        return false;
+    }
+    gFailMyinfo = 0;
+    return true;
 }
 
 static bool pe_vp(float out[16]) {
     uint64_t g = gw(); if (!g) return false;
-    // PC 同自身链前三级，再走 CameraManager → CameraCache
-    uint64_t ch[] = {O_SELF2, O_SELF3, O_SELF4, O_CAMMGR, O_CAMCACHE};
-    uint64_t c = chain(g, ch, 5); if (!c) return false;
-    uint64_t pov = c + O_POV;
-    if (!kreadbuf(pov + 0x1A0, out, 64)) return false;
-    if (out[12] == 0 && out[13] == 0 && out[14] == 0 && out[15] == 0) return false;
+    // PC 同自身链前三级，再走 相机指针(0x680) → CameraCache → POV
+    uint64_t a   = kread64(g + O_SELF2);
+    uint64_t b   = a ? kread64(a + O_SELF3) : 0;
+    uint64_t pc  = b ? kread64(b + O_SELF4) : 0;
+    uint64_t cam = pc ? kread64(pc + O_CAMPTR) : 0;
+    uint64_t cc  = cam ? kread64(cam + O_CAMCACHE) : 0;
+    if (!cc || cc < 0x100000000ULL || cc >= 0x800000000ULL) {
+        if (gFailVp < 3) {
+            PE_LOG_ERROR("相机链断链：GWorld=0x%llx +0x%x→0x%llx +0x%x→0x%llx +0x%x→0x%llx "
+                         "+0x%x(相机指针)→0x%llx +0x%x(CameraCache)→0x%llx",
+                         (unsigned long long)g, O_SELF2, (unsigned long long)a,
+                         O_SELF3, (unsigned long long)b,
+                         O_SELF4, (unsigned long long)pc,
+                         O_CAMPTR, (unsigned long long)cam,
+                         O_CAMCACHE, (unsigned long long)cc);
+            gFailVp++;
+        }
+        return false;
+    }
+    uint64_t pov = cc + O_POV;
+    if (!kreadbuf(pov + 0x1A0, out, 64)) {
+        if (gFailVp < 3) {
+            PE_LOG_ERROR("视图矩阵读取失败：CameraCache=0x%llx +0x%x +0x1A0（POV/矩阵偏移可能过期）",
+                         (unsigned long long)cc, O_POV);
+            gFailVp++;
+        }
+        return false;
+    }
+    if (out[12] == 0 && out[13] == 0 && out[14] == 0 && out[15] == 0) {
+        if (gFailVp < 3) {
+            PE_LOG_ERROR("视图矩阵全零：CameraCache=0x%llx +0x%x +0x1A0 处非矩阵（偏移过期）",
+                         (unsigned long long)cc, O_POV);
+            gFailVp++;
+        }
+        return false;
+    }
+    gFailVp = 0;
     return true;
 }
 
@@ -715,10 +799,26 @@ static NSString *pe_actor_name(uint64_t a) {
 
 static int pe_actors(PE_Enemy *out, int max) {
     uint64_t g = gw(); if (!g) return 0;
-    uint64_t lv = kread64(g + O_PERSISTLEVEL); if (!lv) return 0;
+    uint64_t lv = kread64(g + O_PERSISTLEVEL);
+    if (!lv || lv < 0x100000000ULL || lv >= 0x800000000ULL) {
+        if (gFailActors < 3) {
+            PE_LOG_ERROR("PersistentLevel 无效：GWorld=0x%llx +0x%x→0x%llx（偏移可能过期）",
+                         (unsigned long long)g, O_PERSISTLEVEL, (unsigned long long)lv);
+            gFailActors++;
+        }
+        return 0;
+    }
     uint64_t arr = kread64(lv + O_ACTORS);
     int cnt = (int)kread32(lv + O_ACTORCNT);
-    if (!arr || cnt <= 0 || cnt > 2000) return 0;
+    if (!arr || arr < 0x100000000ULL || arr >= 0x800000000ULL || cnt <= 0 || cnt > 2000) {
+        if (gFailActors < 3) {
+            PE_LOG_ERROR("Actor 数组无效：Level=0x%llx +0x%x→0x%llx cnt(+0x%x)=%d（偏移可能过期）",
+                         (unsigned long long)lv, O_ACTORS, (unsigned long long)arr,
+                         O_ACTORCNT, cnt);
+            gFailActors++;
+        }
+        return 0;
+    }
     int w = 0;
     for (int i = 0; i < cnt && w < max; i++) {
         uint64_t a = kread64(arr + (uint64_t)i * 8); if (!a) continue;
