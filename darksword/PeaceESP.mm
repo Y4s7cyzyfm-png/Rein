@@ -131,6 +131,7 @@ typedef struct {
     float   health, healthMax, distance;
     bool    isAI, isDead;
     int     teamID;
+    __unsafe_unretained NSString *name; // 仅供 tick 内立即使用
     PE_Vec3 top, bottom;
 } PE_Enemy;
 
@@ -476,15 +477,42 @@ static uint64_t pe_nsstring(NSString *value) {
 }
 
 // ============================================================
-// 偏移（需随游戏版本更新）
+// 偏移（2026-09 版本数据，随游戏版本更新）
 // ============================================================
 
 enum {
-    O_GWORLD = 0xF1CD938, O_PERSISTLEVEL = 0xB0, O_ACTORS = 0xA0, O_ACTORCNT = 0xA8,
-    O_NETDRIVER = 0xB8, O_SERVCONN = 0x88, O_LOCALPC = 0x30, O_PAWN = 0x3438,
+    // 全局（映像内）
+    O_GWORLD = 0x1148B608,
+    O_GNAME  = 0x11FBA198,
+
+    // 自身链（GWorld 起，五级指针 → 自身 Pawn）
+    O_SELF2 = 0xC0, O_SELF3 = 0x88, O_SELF4 = 0x30, O_SELF5 = 0x3540,
+
+    // 相机（PlayerController 起；CameraManager/CameraCache/POV 沿用旧值）
     O_CAMMGR = 0x658, O_CAMCACHE = 0x640, O_POV = 0x13A0,
-    O_ROOTCOMP = 0x268, O_LOC = 0x200, O_HP = 0xFD8, O_BDEAD = 0x1058,
-    O_TEAM = 0xB68, O_AI = 0xB84,
+
+    // Actor / Pawn 字段
+    O_ROOTCOMP  = 0x260,  // 坐标指针
+    O_LOC       = 0x200,  // RootComponent 内坐标（沿用旧值）
+    O_NAME      = 0xAF8,  // 玩家名字（FString）
+    O_UID       = 0xB20,  // 玩家 UID
+    O_PLAYERDATA= 0x5F0,  // 玩家数据指针
+    O_ISREAL    = 0xB50,  // 是否真人
+    O_TEAM      = 0xB78,  // 队伍编号
+    O_AI        = 0xB94,  // 人机识别
+    O_HP        = 0x1060, // 当前血量
+    O_HPMAX     = 0x1068, // 最大血量
+    O_ACTION    = 0x1700, // 人物动作
+    O_DEFSPEED  = 0x10BC, // 默认速度值
+    O_CURSPEED  = 0x10C0, // 当前速度值
+
+    // 骨骼（预留，骨骼 ESP 用）
+    O_MESHARRAY = 0x658,  // 阵列偏移
+    O_BONEARRAY = 0x1D0,  // 骨骼阵列
+    O_BONEPTR   = 0x838,  // 骨骼指针
+
+    // 关卡 / Actor 数组（沿用旧值，本次未提供新数据）
+    O_PERSISTLEVEL = 0xB0, O_ACTORS = 0xA0, O_ACTORCNT = 0xA8,
 };
 
 // ============================================================
@@ -636,22 +664,37 @@ static uint64_t chain(uint64_t base, const uint64_t *offs, int n) {
 
 static bool pe_myinfo(void) {
     uint64_t g = gw(); if (!g) return false;
-    uint64_t ch[] = {O_NETDRIVER, O_SERVCONN, O_LOCALPC};
-    uint64_t pc = chain(g, ch, 3); if (!pc) return false;
-    gMyTeam = (int)kread32(pc + O_TEAM);
-    uint64_t pawn = kread64(pc + O_PAWN); if (!pawn) return false;
+    // 自身链：GWorld → +0xC0 → +0x88 → +0x30（PlayerController）→ +0x3540（Pawn）
+    uint64_t ch[] = {O_SELF2, O_SELF3, O_SELF4, O_SELF5};
+    uint64_t pawn = chain(g, ch, 4); if (!pawn) return false;
+    gMyTeam = (int)kread32(pawn + O_TEAM);
     uint64_t rc = kread64(pawn + O_ROOTCOMP); if (!rc) return false;
     return kreadbuf(rc + O_LOC, &gMyPos, sizeof(gMyPos));
 }
 
 static bool pe_vp(float out[16]) {
     uint64_t g = gw(); if (!g) return false;
-    uint64_t ch[] = {O_NETDRIVER, O_SERVCONN, O_LOCALPC, O_CAMMGR, O_CAMCACHE};
+    // PC 同自身链前三级，再走 CameraManager → CameraCache
+    uint64_t ch[] = {O_SELF2, O_SELF3, O_SELF4, O_CAMMGR, O_CAMCACHE};
     uint64_t c = chain(g, ch, 5); if (!c) return false;
     uint64_t pov = c + O_POV;
     if (!kreadbuf(pov + 0x1A0, out, 64)) return false;
     if (out[12] == 0 && out[13] == 0 && out[14] == 0 && out[15] == 0) return false;
     return true;
+}
+
+// 玩家名字（0xAF8，FString：指针 → UTF-16 缓冲）
+static NSString *pe_actor_name(uint64_t a) {
+    uint64_t fstr = kread64(a + O_NAME);
+    if (fstr < 0x100000000ULL || fstr >= 0x800000000ULL) return nil;
+    uint16_t buf[24];
+    if (!kreadbuf(fstr, buf, sizeof(buf))) return nil;
+    int len = 0;
+    while (len < 24 && buf[len] != 0) len++;
+    if (len == 0 || len >= 24) return nil; // 空串或未终止（可疑）
+    if (len > 16) len = 16; // 显示上限
+    return [[NSString alloc] initWithBytes:buf length:(NSUInteger)len * 2
+                                  encoding:NSUTF16LittleEndianStringEncoding];
 }
 
 static int pe_actors(PE_Enemy *out, int max) {
@@ -664,16 +707,18 @@ static int pe_actors(PE_Enemy *out, int max) {
     for (int i = 0; i < cnt && w < max; i++) {
         uint64_t a = kread64(arr + (uint64_t)i * 8); if (!a) continue;
         if ((int)kread32(a + O_TEAM) == gMyTeam && gMyTeam != -1) continue;
-        if (kread32(a + O_BDEAD) & 0xFF) continue;
+        float hp; uint32_t hr = kread32(a + O_HP); memcpy(&hp, &hr, 4); if (hp <= 0) continue;
         uint64_t rc = kread64(a + O_ROOTCOMP); if (!rc) continue;
         PE_Vec3 loc; if (!kreadbuf(rc + O_LOC, &loc, sizeof(loc))) continue;
-        float hp; uint32_t hr = kread32(a + O_HP); memcpy(&hp, &hr, 4); if (hp <= 0) continue;
         float dx = loc.x - gMyPos.x, dy = loc.y - gMyPos.y, dz = loc.z - gMyPos.z;
         float dist = sqrtf(dx * dx + dy * dy + dz * dz); if (dist > PE_FAR_CLIP) continue;
         PE_Enemy *e = &out[w];
-        e->location = loc; e->health = hp; e->healthMax = 100; e->distance = dist;
+        e->location = loc; e->distance = dist;
+        float hmax; uint32_t hmr = kread32(a + O_HPMAX); memcpy(&hmax, &hmr, 4);
+        e->health = hp; e->healthMax = (hmax > 0 && hmax < 10000) ? hmax : 100;
         e->isAI = (kread32(a + O_AI) & 0xFF) != 0; e->isDead = false;
         e->teamID = (int)kread32(a + O_TEAM);
+        e->name = pe_actor_name(a);
         e->bottom = loc; e->top = loc; e->top.z += PE_PLAYER_HEIGHT;
         w++;
     }
@@ -884,6 +929,7 @@ static void peace_esp_tick(void) {
     float vp[16]; if (!pe_vp(vp)) return;
 
     PE_Enemy es[PE_MAX_ENEMIES];
+    for (int i = 0; i < PE_MAX_ENEMIES; i++) es[i].name = nil;
     int n = pe_actors(es, PE_MAX_ENEMIES);
     int vi = 0;
     PE_Rect zeroRect = {0, 0, 0, 0};
@@ -897,7 +943,7 @@ static void peace_esp_tick(void) {
         PE_Rect boxRect = {x, y, (double)w, (double)h};
         pe_box(vi, boxRect, true);
         PE_Rect nameRect = {x - 10, y - 18, (double)w + 20, 16};
-        pe_lbl(gName[vi], (e->isAI ? @"BOT" : @"Player"), nameRect, true);
+        pe_lbl(gName[vi], (e->name.length > 0 ? e->name : (e->isAI ? @"BOT" : @"Player")), nameRect, true);
         char ds[32];
         snprintf(ds, sizeof(ds), "%.0fm", e->distance / 100.0f);
         PE_Rect distRect = {x - 10, (double)y + h + 2, (double)w + 20, 16};
