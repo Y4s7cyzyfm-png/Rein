@@ -18,8 +18,13 @@
 //      条目             → {+0x00 哈希链; +0x08 u32 id; +0x0C u16; +0x0E NUL 结尾名字}
 //    条目 id = (块<<15)|(位置<<1)，与全部观测样本吻合；FName index 的
 //    编码用三候选 + 「GWorld 类名必须是 World」锚点在运行时确定。
-//  - GUObjectArray 的 ObjObjects 内偏移 / Num 偏移 / 每 chunk 元素数
-//    用组合候选自适应（GWorld 反查强校验）。
+//  - GUObjectArray 布局组合候选自适应（GWorld 反查强校验）：
+//      ObjObjects 内偏移 ∈ {0x10, 0x00}；Num 偏移 ∈ {0x14, 0x0C}；
+//      chunk 元素数 1<<{16,13,6}，外加 UE4.18/19 旧式平铺数组（非 chunk，
+//      Objects 本身就是 FUObjectItem 数组——iOS_UEDumper 的 PUBG 画像即此布局）。
+//  - UStruct 代际（4.18 / 4.20-22 / 4.23+）在运行时用「World 的
+//    SuperStruct 类名必须是 Object」锚点校准，防止旧引擎游戏用 4.25
+//    公式生成出错误 SDK。
 //
 
 #import "UESDumper.h"
@@ -245,6 +250,11 @@ static void ud_kread_best_effort(uint64_t va, void *out, size_t sz) {
 }
 
 static bool ud_userland(uint64_t p) { return p >= 0x100000000ULL && p < 0x800000000ULL; }
+
+// 宽指针判定（仅用于 GUObjectArray 定位）：Objects 数组可达十几 MB，
+// 属于大分配，可能落在较高的 VM 区间。最终命中仍由 item==GWorld 强校验
+// 兜底，放宽预筛只影响速度不影响正确性。
+static bool ud_ptr_wide(uint64_t p) { return p >= 0x100000000ULL && p < 0x80000000000ULL; }
 
 // ============================================================
 // GNames（定制 TNameEntryArray 风格；真机诊断已确认布局）
@@ -529,34 +539,72 @@ static bool ud_attach_game(void) {
 // ============================================================
 // 布局候选（iOS_UEDumper 公式 + 真机适配）：
 //   ObjObjects 内偏移 ∈ {0x00, 0x10}；Num 偏移 ∈ {0x0C, 0x14}；
-//   每 chunk 元素数 ∈ {64, 8192, 65536}；FUObjectItem = 0x18。
-// 确认法（强校验）：用已知 GWorld 的 InternalIndex 反查数组，命中即真。
+//   每 chunk 元素数 ∈ {64, 8192, 65536}，以及 UE4.18/19 旧式平铺数组
+//   （非 chunk，Objects 本身就是 FUObjectItem 数组）；FUObjectItem = 0x18。
+// 确认法（强校验）：用已知 GWorld 的 InternalIndex 反查数组，命中即真，
+//   再用数组尾部对象做二次锚定，防止平铺模式下 Num 槽位误中。
 static struct {
     uint32_t innerOff;  // ObjObjects 在候选结构内的偏移
     uint32_t numOff;    // Num 在 TUObjectArray 内的偏移
-    int chunkShift;     // 每 chunk 元素数 = 1 << chunkShift
+    int chunkShift;     // 每 chunk 元素数 = 1 << chunkShift；0 = 平铺（非 chunk）
 } gOA = { 0x10, 0x14, 16 };
 
+static int gUDNearMiss = 0; // 近失候选日志配额（扫描未命中时供离线分析布局）
+
+static const char *ud_oa_desc(void) {
+    static char buf[32];
+    if (gOA.chunkShift == 0) snprintf(buf, sizeof(buf), "flat平铺");
+    else snprintf(buf, sizeof(buf), "chunk=1<<%d", gOA.chunkShift);
+    return buf;
+}
+
+// 按候选布局取第 idx 个 UObject 的槽位值（不校验有效性）
+static uint64_t ud_oa_item_at(uint64_t chunks, uint32_t idx, int chunkShift) {
+    if (chunkShift == 0) {
+        // UE4.18/19 旧式 TUObjectArray：Objects 本身就是平铺 FUObjectItem 数组
+        return ud_kread64(chunks + (uint64_t)idx * 0x18);
+    }
+    uint32_t mask = (1u << chunkShift) - 1;
+    uint64_t chunk = ud_kread64(chunks + (uint64_t)(idx >> chunkShift) * 8);
+    if (!ud_ptr_wide(chunk)) return 0;
+    return ud_kread64(chunk + (uint64_t)(idx & mask) * 0x18);
+}
+
 static bool ud_oa_try(uint64_t V, uint32_t gworldIdx, uint64_t gworld,
-                       uint32_t innerOff, uint32_t numOff, int chunkShift) {
+                      uint32_t innerOff, uint32_t numOff, int chunkShift) {
     uint64_t chunks = ud_kread64(V + innerOff);
-    if (!ud_userland(chunks)) return false;
+    if (!ud_ptr_wide(chunks)) return false;
     int32_t numE = (int32_t)ud_kread32(V + innerOff + numOff);
     int32_t maxE = (int32_t)ud_kread32(V + innerOff + numOff - 4); // Max 紧邻 Num 之前
     if (numE <= 0 || numE > 0x10000000) return false;
     if (maxE < numE || maxE > 0x10000000) return false;
     if ((uint32_t)numE <= gworldIdx) return false;
-    uint32_t mask = (1u << chunkShift) - 1;
-    uint64_t chunk = ud_kread64(chunks + (uint64_t)(gworldIdx >> chunkShift) * 8);
-    if (!ud_userland(chunk)) return false;
-    uint64_t item = ud_kread64(chunk + (uint64_t)(gworldIdx & mask) * 0x18);
-    return item == gworld;
+    if (ud_oa_item_at(chunks, gworldIdx, chunkShift) != gworld) {
+        // 近失诊断：Num/Max 形似但反查未中（限量记录，失败时据此分析布局）
+        if (gUDNearMiss < 16) {
+            UD_LOG("近失候选 base+0x%llx（Obj@+0x%x Num@+0x%x %s：Num=%d Max=%d）",
+                   (unsigned long long)(V - gBase), innerOff, numOff,
+                   chunkShift == 0 ? "flat" : "chunk", numE, maxE);
+            gUDNearMiss++;
+        }
+        return false;
+    }
+    // Num 槽位二次锚定：平铺模式下 item==GWorld 不依赖 Num 偏移，须防止
+    // 相邻字段碰巧形似 Num 导致锁错槽位——数组尾部（Num-1..Num-4）至少
+    // 一个槽位须是可解出名字的合法 UObject。
+    bool tailOK = false;
+    for (int back = 1; back <= 4 && !tailOK; back++) {
+        if (numE <= back) break;
+        uint64_t t = ud_oa_item_at(chunks, (uint32_t)(numE - back), chunkShift);
+        if (ud_userland(t) && ud_obj_name(t)) tailOK = true;
+    }
+    return tailOK;
 }
 
 static bool ud_gobjects_confirms(uint64_t V, uint32_t gworldIdx, uint64_t gworld) {
     static const uint32_t kInner[] = { 0x10, 0x00 };
     static const uint32_t kNum[] = { 0x14, 0x0C };
-    static const int kShift[] = { 16, 13, 6 };
+    static const int kShift[] = { 16, 13, 6, 0 }; // 0 = UE4.18/19 平铺数组
     for (size_t a = 0; a < sizeof(kInner) / sizeof(kInner[0]); a++) {
         for (size_t b = 0; b < sizeof(kNum) / sizeof(kNum[0]); b++) {
             for (size_t c = 0; c < sizeof(kShift) / sizeof(kShift[0]); c++) {
@@ -575,10 +623,11 @@ static bool ud_gobjects_confirms(uint64_t V, uint32_t gworldIdx, uint64_t gworld
 // 按已锁定的布局取第 idx 个 UObject
 static uint64_t ud_uobject_at(uint32_t idx) {
     uint64_t chunks = ud_kread64(gGObjects + gOA.innerOff);
-    if (!ud_userland(chunks)) return 0;
+    if (!ud_ptr_wide(chunks)) return 0;
+    if (gOA.chunkShift == 0) return ud_kread64(chunks + (uint64_t)idx * 0x18);
     uint32_t mask = (1u << gOA.chunkShift) - 1;
     uint64_t chunk = ud_kread64(chunks + (uint64_t)(idx >> gOA.chunkShift) * 8);
-    if (!ud_userland(chunk)) return 0;
+    if (!ud_ptr_wide(chunk)) return 0;
     return ud_kread64(chunk + (uint64_t)(idx & mask) * 0x18);
 }
 
@@ -599,20 +648,22 @@ static bool ud_find_gobjects(void) {
         return false;
     }
     UD_LOG("GWorld InternalIndex=%u，开始定位 GUObjectArray", gworldIdx);
+    gUDNearMiss = 0;
 
     if (UE.offGObjects != 0) {
         if (ud_gobjects_confirms(gBase + UE.offGObjects, gworldIdx, gGWorld)) {
             gGObjects = gBase + UE.offGObjects;
-            UD_LOG("GUObjectArray 命中记忆偏移 0x%x（ObjObjects@+0x%x Num@+0x%x chunk=1<<%d）",
-                   UE.offGObjects, gOA.innerOff, gOA.numOff, gOA.chunkShift);
+            UD_LOG("GUObjectArray 命中记忆偏移 0x%x（ObjObjects@+0x%x Num@+0x%x %s）",
+                   UE.offGObjects, gOA.innerOff, gOA.numOff, ud_oa_desc());
             return true;
         }
         UD_LOG("记忆偏移 0x%x 校验失败，重新扫描", UE.offGObjects);
     }
 
-    // 扫描范围：GNames 全局附近 ±（两者同处链接数据段，通常相距不远）
+    // 扫描范围：GNames 全局附近 ±（两者同处链接数据段，通常相距不远）；
+    // 上界放宽到 +32MB（部分版本 GUObjectArray 排在 GNames 之后较远处）
     const uint64_t scanLoOff = (UE.offGNames > 0x4000000) ? (UE.offGNames - 0x4000000) : 0;
-    const uint64_t scanHiOff = (uint64_t)UE.offGNames + 0x1000000;
+    const uint64_t scanHiOff = (uint64_t)UE.offGNames + 0x2000000;
     const uint64_t scanLo = gBase + scanLoOff, scanHi = gBase + scanHiOff;
     UD_LOG("扫描 [0x%llx, 0x%llx)（约 %llu MB）…",
            (unsigned long long)scanLo, (unsigned long long)scanHi,
@@ -633,7 +684,7 @@ static bool ud_find_gobjects(void) {
                     uint64_t p10, p00;
                     memcpy(&p10, scanBuf + o + 0x10, 8);
                     memcpy(&p00, scanBuf + o, 8);
-                    if (!ud_userland(p10) && !ud_userland(p00)) continue;
+                    if (!ud_ptr_wide(p10) && !ud_ptr_wide(p00)) continue;
                     if (ud_gobjects_confirms(V, gworldIdx, gGWorld)) {
                         found = V;
                         *stop = YES;
@@ -653,9 +704,72 @@ static bool ud_find_gobjects(void) {
     gGObjects = found;
     UE.offGObjects = (uint32_t)(found - gBase);
     [d setInteger:UE.offGObjects forKey:kUDGObjectsOffKey];
-    UD_LOG("GUObjectArray=0x%llx（base+0x%x，ObjObjects@+0x%x Num@+0x%x chunk=1<<%d，已记忆）",
-           (unsigned long long)found, UE.offGObjects, gOA.innerOff, gOA.numOff, gOA.chunkShift);
+    UD_LOG("GUObjectArray=0x%llx（base+0x%x，ObjObjects@+0x%x Num@+0x%x，%s，已记忆）",
+           (unsigned long long)found, UE.offGObjects, gOA.innerOff, gOA.numOff, ud_oa_desc());
     return true;
+}
+
+// ============================================================
+// UStruct 布局代际校准（锚点：World 的 SuperStruct 类名必须是 "Object"）
+// ============================================================
+// iOS_UEDumper 的 PUBG 画像 = UE4.18/19：SuperStruct@+0x30、无 FField、
+// 旧式 UProperty 挂 Children；UE4.23+ = SuperStruct@+0x40、FField 链。
+// 运行时锚点判定，命中旧式则切换整套字段偏移，避免 SDK 全盘错位。
+static void ud_calibrate_struct_layout(void) {
+    uint64_t worldCls = ud_kread64(gGWorld + UE.uobjClass);
+    if (!ud_userland(worldCls)) return;
+
+    for (int gen = 0; gen < 2; gen++) {
+        uint32_t superOff = (gen == 0) ? UE.ustructSuper : 0x30; // 先验证当前默认，再试 4.18
+        if (superOff != 0x30 && superOff != 0x40) continue;
+        uint64_t super = ud_kread64(worldCls + superOff);
+        if (!ud_userland(super)) continue;
+        const char *n = ud_obj_name(super);
+        if (!n || strcmp(n, "Object") != 0) continue;
+
+        if (superOff == 0x30) {
+            // UE4.18/19 旧式布局（iOS_UEDumper PUBG 画像公式）
+            UE.ustructSuper = 0x30;
+            UE.ustructChildren = 0x38;
+            UE.ustructChildProps = 0;   // 无 FField，属性挂 Children
+            UE.ustructSize = 0x40;
+            UE.fpropArrayDim = 0x30;    // 旧式 UProperty::ArrayDim
+            UE.fpropOffset = 0x44;      // 旧式 UProperty::Offset_Internal
+            UE.ufuncExec = 0xB0;        // 旧式 UFunction::Func
+            UD_LOG("UStruct 布局 = UE4.18/19 旧式（SuperStruct@+0x30 ✓，无 FField）");
+            return;
+        }
+
+        // SuperStruct@+0x40：区分 4.20-22（旧式 UProperty 挂 Children）与 4.23+（FField）
+        UD_LOG("UStruct 布局 = UE4.23+（SuperStruct@+0x40 ✓）");
+        uint64_t ch = ud_kread64(worldCls + UE.ustructChildren);
+        int nProp = 0, nChild = 0;
+        while (ud_userland(ch) && nChild < 16) {
+            uint64_t c = ud_kread64(ch + UE.uobjClass);
+            const char *cn = ud_userland(c) ? ud_obj_name(c) : NULL;
+            if (cn) {
+                if (nChild < 6) {
+                    const char *chName = ud_obj_name(ch);
+                    UD_LOG("World 类 Child[%d] = %s（%s）", nChild,
+                           chName ? chName : "?", cn);
+                }
+                if (strstr(cn, "Property")) nProp++;
+            }
+            ch = ud_kread64(ch + UE.ufieldNext);
+            nChild++;
+        }
+        if (nProp > 0) {
+            // UE4.20-22：SuperStruct 同 4.23 位置，但属性仍是旧式 UProperty
+            UE.ustructChildProps = 0;
+            UE.ustructSize = 0x50;
+            UE.fpropArrayDim = 0x30;
+            UE.fpropOffset = 0x44;
+            UE.ufuncExec = 0xC0;
+            UD_LOG("UStruct 布局修正 = UE4.20-22（Children 上发现旧式 UProperty）");
+        }
+        return;
+    }
+    UD_LOG("UStruct SuperStruct 锚点未命中 Object（保持 4.25 公式，SDK 字段可能不准）");
 }
 
 // ============================================================
@@ -748,11 +862,32 @@ static void ud_dump_function(FILE *sdk, uint64_t func) {
     const char *fname = ud_name_cached(ud_kread32(func + UE.uobjName));
     if (!fname) return;
 
-    // 参数 = 函数的 ChildProperties（FProperty 链）
+    // 参数 = 函数的 ChildProperties（FProperty 链）；
+    // UE4.22- 旧式无 FField，参数挂 Children 链（UProperty）
     char params[1024];
     params[0] = 0;
     size_t used = 0;
-    uint64_t p = ud_kread64(func + UE.ustructChildProps);
+    if (UE.ustructChildProps == 0) {
+        uint64_t lp = ud_kread64(func + UE.ustructChildren);
+        while (ud_userland(lp) && used + 2 < sizeof(params)) {
+            uint64_t pc = ud_kread64(lp + UE.uobjClass);
+            const char *pcn = ud_userland(pc) ? ud_obj_name(pc) : NULL;
+            if (!pcn || !strstr(pcn, "Property")) {
+                lp = ud_kread64(lp + UE.ufieldNext); // 非属性子项（不应出现）跳过
+                continue;
+            }
+            char pname[128] = "", pcls[64] = "";
+            const char *pn = ud_name_cached(ud_kread32(lp + UE.uobjName));
+            if (pn) snprintf(pname, sizeof(pname), "%s", pn);
+            ud_type_for_prop_class(pcn, pcls, sizeof(pcls));
+            int w = snprintf(params + used, sizeof(params) - used, "%s%s %s, ",
+                             used ? "; " : "", pcls[0] ? pcls : "uint8_t", pname);
+            if (w <= 0) break;
+            used += (size_t)w;
+            lp = ud_kread64(lp + UE.ufieldNext);
+        }
+    }
+    uint64_t p = UE.ustructChildProps ? ud_kread64(func + UE.ustructChildProps) : 0;
     while (ud_userland(p) && used + 2 < sizeof(params)) {
         char pname[128] = "", pcls[64] = "";
         const char *pn = ud_name_cached(ud_kread32(p + UE.ffieldName));
@@ -794,8 +929,8 @@ static void ud_dump_class(FILE *sdk, uint64_t klass) {
     fprintf(sdk, "\n// %s\n", path);
     fprintf(sdk, "class U%s : public U%s { // Size: 0x%X\n", leaf, superLeaf, size);
 
-    // 字段（FField 链，UE4.23+）
-    uint64_t childProps = ud_kread64(klass + UE.ustructChildProps);
+    // 字段（FField 链，UE4.23+；UE4.22- 旧式无 FField，走下方 Children 的 UProperty 分支）
+    uint64_t childProps = UE.ustructChildProps ? ud_kread64(klass + UE.ustructChildProps) : 0;
     int propCount = 0;
     while (ud_userland(childProps) && propCount < 0x800) {
         ud_dump_property(sdk, childProps, true);
@@ -871,6 +1006,7 @@ static bool ud_dump_all(NSString *outDir) {
         ud_fail(@"GUObjectArray 复核失败（状态变化）");
         return false;
     }
+    ud_calibrate_struct_layout(); // UStruct 代际校准（4.18 / 4.20-22 / 4.23+）
     int32_t numE = ud_uobject_count();
     if (numE <= 0 || numE > 0x10000000) { ud_fail(@"GUObjectArray Num 异常"); return false; }
     UD_LOG("开始遍历 %d 个对象…", numE);
@@ -956,8 +1092,8 @@ static bool ud_dump_all(NSString *outDir) {
     fprintf(offs, "GWorld: 0x%llx (base + 0x%x)\n", (unsigned long long)gGWorld, UE.offGWorld);
     fprintf(offs, "GNames: 0x%llx (base + 0x%x, 定制 TNameEntryArray, indexMode=%d)\n",
             (unsigned long long)gGNames, UE.offGNames, gNameIndexMode);
-    fprintf(offs, "GUObjectArray: 0x%llx (base + 0x%x, ObjObjects@+0x%x Num@+0x%x chunk=1<<%d)\n",
-            (unsigned long long)gGObjects, UE.offGObjects, gOA.innerOff, gOA.numOff, gOA.chunkShift);
+    fprintf(offs, "GUObjectArray: 0x%llx (base + 0x%x, ObjObjects@+0x%x Num@+0x%x %s)\n",
+            (unsigned long long)gGObjects, UE.offGObjects, gOA.innerOff, gOA.numOff, ud_oa_desc());
     fprintf(offs, "ObjectCount: %d\n", numE);
     fclose(offs);
 
