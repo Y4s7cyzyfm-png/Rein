@@ -493,7 +493,7 @@ enum {
 
     // 相机（PC → 相机指针 0x680 → CameraCache/POV 沿用旧值，待验证）
     O_CAMPTR  = 0x680,  // 相机指针（自 PC）
-    O_CAMCACHE = 0x640, // Cache 条目指针（自相机；POV 在 Cache+0x28）
+    O_CAMCACHE = 0x640, // 旧猜测：Cache 条目（自相机）——已由运行时校准取代，仅留档
 
     // Actor / Pawn 字段（安卓 SDK 对照表，iOS 同源）
     O_ROOTCOMP  = 0x260,  // 坐标1（RootComponent 指针）不动
@@ -548,6 +548,20 @@ enum {
     // 掩体判断（自身 → 玩家控制器 0x60C8 → 相机指针 0x680；调用 Controller.LineOfSightTo）
     O_PC_FROM_PAWN = 0x60C8,
 };
+
+// ---- 运行时偏移校准（2026-09-06 真机：相机 POV 读数 rot=(0,0,0)/loc≈0，
+// 而 Actor 出现真实地图坐标——O_LOC 与 POV 布局均不可靠，改锚点自适应）----
+// 锚点：相机 POV.Location 必然紧邻自身 Pawn 的 RootComponent 坐标
+// （TPP 相机在人物身后 0~5 米）。对 RootComponent 与相机对象做候选向量
+// 联合扫描，距离 < 1500cm 的组合即正确偏移对。
+static uint32_t gLocOff = 0;     // RootComponent 内 Location 偏移（0 = 未校准，回落 O_LOC）
+static uint32_t gPovLocOff = 0;  // 相机对象内 POV.Location 偏移（0 = 未校准）
+static bool gCamFromSelfChain = false; // 相机链选择（false = pawn+0x60C8 链）
+static int gCalibFail = 0;       // 校准失败计数（限流 dump）
+static int gVpSanityFail = 0;    // POV 合理性连续失败计数（超限重置校准）
+static bool gMyPosLogged = false;
+
+static uint32_t pe_loc_off(void) { return gLocOff ? gLocOff : O_LOC; }
 
 // ============================================================
 // 第 1 层：游戏内存
@@ -733,21 +747,87 @@ static bool pe_myinfo(void) {
         }
         return false;
     }
-    if (!kreadbuf(rc + O_LOC, &gMyPos, sizeof(gMyPos))) {
+    if (!kreadbuf(rc + pe_loc_off(), &gMyPos, sizeof(gMyPos))) {
         if (gFailMyinfo < 3) {
             PE_LOG_ERROR("自身坐标读取失败：RootComp=0x%llx +0x%x（O_LOC 可能过期）",
-                         (unsigned long long)rc, O_LOC);
+                         (unsigned long long)rc, pe_loc_off());
             gFailMyinfo++;
         }
         return false;
+    }
+    if (!gMyPosLogged) {
+        PE_LOG("自身坐标：pawn=0x%llx loc=(%.1f, %.1f, %.1f) [Root+0x%x]",
+               (unsigned long long)pawn, gMyPos.x, gMyPos.y, gMyPos.z, pe_loc_off());
+        gMyPosLogged = true;
     }
     gFailMyinfo = 0;
     return true;
 }
 
-// 相机 POV（安卓表：Fov1 0x60C8 / Fov2 0x680 / Fov3[+0x40] 0x640）
-// 链：GWorld → 0xC0 → 0x88 → 0x30（PC）→ +0x680（相机）→ +0x640（Cache 条目）
-// POV（FMinimalViewInfo）落在 Cache+0x28：Location +0x28，Rotation +0x34，FOV +0x40
+// 指定地址起 n 字节的 hex+ASCII 双视图（诊断用）
+static void pe_dump_hex(const char *tag, uint64_t addr, int bytes) {
+    uint8_t b[64];
+    int n = (bytes < 64) ? bytes : 64;
+    if (n <= 0) return;
+    if (!kreadbuf(addr, b, (size_t)n)) {
+        PE_LOG("%s @0x%llx = <读取失败>", tag, (unsigned long long)addr);
+        return;
+    }
+    NSMutableString *hex = [NSMutableString string];
+    NSMutableString *asc = [NSMutableString string];
+    for (int i = 0; i < n; i++) {
+        [hex appendFormat:@"%02x ", b[i]];
+        [asc appendFormat:@"%c", (b[i] >= 0x20 && b[i] <= 0x7E) ? b[i] : '.'];
+    }
+    PE_LOG("%s @0x%llx\n  hex: %@\n  asc: %@", tag, (unsigned long long)addr, hex, asc);
+}
+
+// 联合校准：在 RootComponent 与相机对象里找「相距 < 1500cm」的坐标向量对。
+// 命中即锁定 gLocOff（RootComponent 内 Location）与 gPovLocOff（相机内
+// POV.Location；Rotation=+0xC，FOV=+0x18，按 FMinimalViewInfo 内部布局）。
+static bool pe_calibrate_offsets(uint64_t rc, uint64_t camPtr) {
+    static unsigned char rcBuf[0x300], camBuf[0x800];
+    if (!kreadbuf(rc, rcBuf, sizeof(rcBuf))) return false;
+    if (!kreadbuf(camPtr, camBuf, 0x400)) return false;
+    // 相机对象高半段可能越界（对象不足 0x800）——读到多少扫多少
+    size_t camSpan = kreadbuf(camPtr + 0x400, camBuf + 0x400, 0x400) ? 0x800 : 0x400;
+
+    uint32_t bestRc = 0, bestPov = 0;
+    float bestDist = 1500.0f;
+    for (uint32_t oRc = 0x40; oRc + 12 <= 0x300; oRc += 4) {
+        PE_Vec3 v;
+        memcpy(&v, rcBuf + oRc, 12);
+        // 对局内真实地图坐标（十万 cm 量级）；原点附近的小坐标无法与相机区分
+        if (fabsf(v.x) < 1000.0f && fabsf(v.y) < 1000.0f) continue;
+        if (fabsf(v.x) > 1e6f || fabsf(v.y) > 1e6f || fabsf(v.z) > 1e5f) continue;
+        for (uint32_t o = 0; o + 0x1C <= camSpan; o += 4) {
+            PE_Vec3 p;
+            memcpy(&p, camBuf + o, 12);
+            float dx = p.x - v.x, dy = p.y - v.y, dz = p.z - v.z;
+            float d = sqrtf(dx * dx + dy * dy + dz * dz);
+            if (d >= bestDist) continue;
+            PE_Vec3 r;
+            memcpy(&r, camBuf + o + 0xC, 12);
+            if (r.x < -95.0f || r.x > 95.0f) continue;   // Pitch
+            if (r.y < -185.0f || r.y > 185.0f) continue; // Yaw
+            if (r.z < -185.0f || r.z > 185.0f) continue; // Roll
+            float fov;
+            memcpy(&fov, camBuf + o + 0x18, 4);
+            if (fov < 40.0f || fov > 120.0f) continue;
+            bestDist = d; bestRc = oRc; bestPov = o;
+        }
+    }
+    if (!bestRc) return false;
+    gLocOff = bestRc;
+    gPovLocOff = bestPov;
+    PE_LOG("偏移校准命中：RootComp.Loc@+0x%x，POV.Loc@相机+0x%x（相机距自身 %.0fcm）",
+           gLocOff, gPovLocOff, bestDist);
+    return true;
+}
+
+// 相机 POV：偏移由 pe_calibrate_offsets 运行时锁定（锚点 = 相机紧邻自身）。
+// 相机链两条候选：A = 安卓表链（Pawn+0x60C8 → PC' → +0x680）；
+//                B = 自身链 PC（b+0x30）→ +0x680。校准时分别尝试。
 typedef struct {
     PE_Vec3 loc;   // 相机位置
     PE_Vec3 rot;   // 旋转（Pitch / Yaw / Roll，度）
@@ -756,48 +836,78 @@ typedef struct {
 
 static bool pe_vp(PECamera *cam) {
     uint64_t g = gw(); if (!g) return false;
-    // 相机链（按安卓表）：
-    //   GWorld +0xC0 → +0x88 → +0x30（三级对象）→ +0x3540（自身 Pawn）
-    //   Pawn +0x60C8（玩家控制器，见“掩体判断”区）→ +0x680（相机）→ +0x640（Cache 条目）
-    //   POV 落在 Cache+0x28：Location/Rotation/FOV（FOV 正好落在 +0x40，与表 Fov3[+0x40] 吻合）
+    // 自身链：GWorld → +0xC0 → +0x88 → +0x30（PC）→ +0x3540（Pawn）
     uint64_t a    = kread64(g + O_SELF2);
     uint64_t b    = a ? kread64(a + O_SELF3) : 0;
     uint64_t c    = b ? kread64(b + O_SELF4) : 0;
     uint64_t pawn = c ? kread64(c + O_SELF5) : 0;
-    uint64_t pc   = pawn ? kread64(pawn + O_PC_FROM_PAWN) : 0;
-    uint64_t camPtr = pc ? kread64(pc + O_CAMPTR) : 0;
-    if (!camPtr || camPtr < 0x100000000ULL || camPtr >= 0x800000000ULL) {
+    if (!pawn || pawn < 0x100000000ULL || pawn >= 0x800000000ULL) {
         if (gFailVp < 3) {
-            PE_LOG_ERROR("相机链断链：GWorld=0x%llx +0x%x→0x%llx +0x%x→0x%llx +0x%x→0x%llx "
-                         "+0x%x(Pawn)→0x%llx +0x%x(PC)→0x%llx +0x%x(相机)→0x%llx",
+            PE_LOG_ERROR("相机链断链（自身 Pawn 无效）：GWorld=0x%llx +0x%x→0x%llx +0x%x→0x%llx "
+                         "+0x%x→0x%llx +0x%x(Pawn)→0x%llx",
                          (unsigned long long)g, O_SELF2, (unsigned long long)a,
                          O_SELF3, (unsigned long long)b,
                          O_SELF4, (unsigned long long)c,
-                         O_SELF5, (unsigned long long)pawn,
-                         O_PC_FROM_PAWN, (unsigned long long)pc,
-                         O_CAMPTR, (unsigned long long)camPtr);
+                         O_SELF5, (unsigned long long)pawn);
             gFailVp++;
         }
         return false;
     }
-    // POV 内嵌在相机对象 +0x640（表：Fov3[+0x40] 0x0640——FOV 在该结构 +0x40）。
-    // 之前把它当指针解引用读到 0x4104b96f/0x403462e3，按 float 正是 8.14/3.05
-    // ——UE4 FCameraCacheEntry.TimeStamp（秒），证实结构是内嵌的：
-    //   +0x00 TimeStamp(float)  +0x28 Location  +0x34 Rotation  +0x40 FOV
-    uint64_t povBase = camPtr + O_CAMCACHE;
-    // POV：+0x28 Location / +0x34 Rotation / +0x40 FOV，一次读完（0x28+0x1C = 68 字节）
-    unsigned char buf[68];
-    if (!kreadbuf(povBase + 0x28, buf, sizeof(buf))) {
+    // 相机候选链 ×2
+    uint64_t pcAlt = kread64(pawn + O_PC_FROM_PAWN);
+    uint64_t camA = (pcAlt >= 0x100000000ULL && pcAlt < 0x800000000ULL)
+        ? kread64(pcAlt + O_CAMPTR) : 0;
+    uint64_t camB = (c >= 0x100000000ULL && c < 0x800000000ULL)
+        ? kread64(c + O_CAMPTR) : 0;
+    bool validA = camA >= 0x100000000ULL && camA < 0x800000000ULL;
+    bool validB = camB >= 0x100000000ULL && camB < 0x800000000ULL;
+
+    // POV 偏移未校准 → 用「相机位置 ≈ 自身坐标」锚点，两条链分别尝试
+    if (!gPovLocOff) {
+        uint64_t rc = kread64(pawn + O_ROOTCOMP);
+        bool rcOK = rc >= 0x100000000ULL && rc < 0x800000000ULL;
+        if (rcOK && validA && pe_calibrate_offsets(rc, camA)) {
+            gCamFromSelfChain = false;
+        } else if (rcOK && validB && pe_calibrate_offsets(rc, camB)) {
+            gCamFromSelfChain = true;
+        } else {
+            if (gCalibFail < 3) {
+                PE_LOG_ERROR("POV 偏移校准未命中（camA=0x%llx camB=0x%llx rc=0x%llx；"
+                             "需在对局内（大地图坐标）重试，或把以下 dump 发回分析）",
+                             (unsigned long long)(validA ? camA : 0),
+                             (unsigned long long)(validB ? camB : 0),
+                             (unsigned long long)(rcOK ? rc : 0));
+                if (validA) pe_dump_hex("相机A+0x600", camA + 0x600, 64);
+                if (validB) pe_dump_hex("相机B+0x600", camB + 0x600, 64);
+                if (rcOK) pe_dump_hex("Root+0x1c0", rc + 0x1C0, 64);
+                gCalibFail++;
+            }
+            return false;
+        }
+    }
+    uint64_t camPtr = gCamFromSelfChain ? camB : camA;
+    if (!(camPtr >= 0x100000000ULL && camPtr < 0x800000000ULL)) {
         if (gFailVp < 3) {
-            PE_LOG_ERROR("POV 读取失败：相机=0x%llx +0x%x +0x28（POV 布局可能不符）",
-                         (unsigned long long)camPtr, O_CAMCACHE);
+            PE_LOG_ERROR("相机链断链：camPtr=0x%llx（链=%@）",
+                         (unsigned long long)camPtr,
+                         gCamFromSelfChain ? @"自身链" : @"安卓表链");
             gFailVp++;
         }
         return false;
     }
-    memcpy(&cam->loc, buf, 12);        // +0x28
-    memcpy(&cam->rot, buf + 0xC, 12);  // +0x34
-    memcpy(&cam->fov, buf + 0x18, 4);  // +0x40
+    // POV（校准锁定偏移）：Location / Rotation(+0xC) / FOV(+0x18)，一次读完
+    unsigned char buf[0x1C];
+    if (!kreadbuf(camPtr + gPovLocOff, buf, sizeof(buf))) {
+        if (gFailVp < 3) {
+            PE_LOG_ERROR("POV 读取失败：相机=0x%llx +0x%x",
+                         (unsigned long long)camPtr, gPovLocOff);
+            gFailVp++;
+        }
+        return false;
+    }
+    memcpy(&cam->loc, buf, 12);
+    memcpy(&cam->rot, buf + 0xC, 12);
+    memcpy(&cam->fov, buf + 0x18, 4);
     // 合理性校验：FOV 10..170，位置在用户态量级
     if (cam->fov < 10.0f || cam->fov > 170.0f ||
         fabsf(cam->loc.x) > 1e7f || fabsf(cam->loc.y) > 1e7f || fabsf(cam->loc.z) > 1e7f) {
@@ -809,12 +919,19 @@ static bool pe_vp(PECamera *cam) {
                          cam->rot.x, cam->rot.y, cam->rot.z, cam->fov);
             gFailVp++;
         }
+        // 持续异常（换图/重开局后布局变化）→ 重置校准，下帧重新锚定
+        if (++gVpSanityFail > 30) {
+            gPovLocOff = 0; gLocOff = 0; gVpSanityFail = 0;
+            gMyPosLogged = false;
+            PE_LOG("POV 持续异常，重置偏移校准");
+        }
         return false;
     }
+    gVpSanityFail = 0;
     if (gFailVp == 0) { // 首次成功打一遍，便于核对
-        PE_LOG("相机就绪：loc=(%.1f,%.1f,%.1f) rot=(%.1f,%.1f,%.1f) fov=%.1f",
+        PE_LOG("相机就绪：loc=(%.1f,%.1f,%.1f) rot=(%.1f,%.1f,%.1f) fov=%.1f [POV@相机+0x%x]",
                cam->loc.x, cam->loc.y, cam->loc.z,
-               cam->rot.x, cam->rot.y, cam->rot.z, cam->fov);
+               cam->rot.x, cam->rot.y, cam->rot.z, cam->fov, gPovLocOff);
         gFailVp = 1; // 防重复打印（0 是“未打印”哨兵）
     }
     return true;
@@ -873,21 +990,21 @@ static int pe_actors(PE_Enemy *out, int max) {
             continue;
         }
         PE_Vec3 loc;
-        if (!kreadbuf(rc + O_LOC, &loc, sizeof(loc))) {
+        if (!kreadbuf(rc + pe_loc_off(), &loc, sizeof(loc))) {
             if (gFailActors < 3) {
                 PE_LOG_ERROR("Actor坐标读取失败：actor=0x%llx root=0x%llx locOff=0x%x",
                              (unsigned long long)a,
                              (unsigned long long)rc,
-                             O_LOC);
+                             pe_loc_off());
                 gFailActors++;
             }
             continue;
         }
         static int sCoordSampleLogged = 0; // 坐标采样打印限流（前 3 个，防 30fps 刷屏）
         if (sCoordSampleLogged < 3) {
-            PE_LOG("Actor坐标：0x%llx -> (%.1f, %.1f, %.1f)",
+            PE_LOG("Actor坐标：0x%llx -> (%.1f, %.1f, %.1f) [+0x%x]",
                    (unsigned long long)a,
-                   loc.x, loc.y, loc.z);
+                   loc.x, loc.y, loc.z, pe_loc_off());
             sCoordSampleLogged++;
         }
         float dx = loc.x - gMyPos.x, dy = loc.y - gMyPos.y, dz = loc.z - gMyPos.z;
@@ -1136,7 +1253,11 @@ static void peace_esp_tick(void) {
     int n = pe_actors(es, PE_MAX_ENEMIES);
     static int sLoggedCount = 0; // 首帧打一次敌人数，便于确认 Actor 列表是否可用
     if (sLoggedCount < 3) {
-        PE_LOG("帧数据：敌人数=%d（0 且无报错 = Actor 过滤全灭，坐标/血量偏移可疑）", n);
+        PE_LOG("帧数据：敌人数=%d my=(%.0f,%.0f,%.0f) cam=(%.0f,%.0f,%.0f) rot=(%.0f,%.0f,%.0f) fov=%.0f"
+               "（敌人数 0 且无报错 = Actor 过滤全灭，偏移可疑）",
+               n, gMyPos.x, gMyPos.y, gMyPos.z,
+               cam.loc.x, cam.loc.y, cam.loc.z,
+               cam.rot.x, cam.rot.y, cam.rot.z, cam.fov);
         sLoggedCount++;
     }
     int w2sVisible = 0;
@@ -1181,6 +1302,18 @@ static void peace_esp_tick(void) {
     if (sDrawDiagLogged < 3 || (gFrames % 150) == 0) {
         PE_LOG("绘制诊断：actors=%d w2s=%d onscreen=%d visibleViews=%d",
                n, w2sVisible, onscreen, gVis);
+        // 全部投出屏幕时打出采样（世界 → 屏幕），便于离线核对相机/投影
+        if (onscreen == 0 && w2sVisible > 0) {
+            for (int i = 0; i < n; i++) {
+                PE_Vec2S tp = w2s(es[i].top, &cam, gSW, gSH);
+                if (tp.visible) {
+                    PE_LOG("w2s 采样：world=(%.0f,%.0f,%.0f) -> screen=(%.0f,%.0f)",
+                           es[i].location.x, es[i].location.y, es[i].location.z,
+                           tp.x, tp.y);
+                    break;
+                }
+            }
+        }
     }
     sDrawDiagLogged++;
 
@@ -1212,6 +1345,8 @@ void PeaceESPStart(void) {
     gLastError = @"";
     gLastErrorDetail = @"";
     gFrames = 0; gVis = 0;
+    gLocOff = 0; gPovLocOff = 0; gCamFromSelfChain = false;
+    gCalibFail = 0; gVpSanityFail = 0; gMyPosLogged = false;
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
