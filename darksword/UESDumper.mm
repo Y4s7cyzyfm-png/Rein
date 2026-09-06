@@ -343,54 +343,82 @@ static void ud_fail(NSString *msg) {
 // ============================================================
 static uint64_t gBase = 0, gGWorld = 0, gGObjects = 0;
 
-// 指定地址起 16 字节的十六进制串（诊断用）
-static NSString *ud_hex16(uint64_t addr) {
-    uint8_t b[16];
-    if (!ud_kreadbuf(addr, b, sizeof(b))) return @"<读取失败>";
-    NSMutableString *s = [NSMutableString string];
-    for (int i = 0; i < 16; i++) [s appendFormat:@"%02x ", b[i]];
-    return s;
+// 指定地址起 n 字节的 hex+ASCII 双视图（诊断用；ASCII 是关键——
+// 名字条目在 ASCII 视图里直接可读，一眼区分「名字数据 / 指针 / 加密乱码」）
+static void ud_dump_hex_ascii(const char *tag, uint64_t addr, int bytes) {
+    uint8_t b[64];
+    int n = (bytes < 64) ? bytes : 64;
+    if (n <= 0) return;
+    if (!ud_kreadbuf(addr, b, (size_t)n)) {
+        UD_LOG("%s @0x%llx = <读取失败>", tag, (unsigned long long)addr);
+        return;
+    }
+    NSMutableString *hex = [NSMutableString string];
+    NSMutableString *asc = [NSMutableString string];
+    for (int i = 0; i < n; i++) {
+        [hex appendFormat:@"%02x ", b[i]];
+        [asc appendFormat:@"%c", (b[i] >= 0x20 && b[i] <= 0x7E) ? b[i] : '.'];
+    }
+    UD_LOG("%s @0x%llx\n  hex: %@\n  asc: %@", tag, (unsigned long long)addr, hex, asc);
 }
 
-/// GNames 自检失败时的诊断 + 自适应：
-/// 1) 打印名字池头部原始内存——离线区分「offGNames 错 / 布局不符 / 名字加密」：
-///    - pool 头部本身像随机值        → offGNames 有误
-///    - blocks[0] 指向的 16 字节乱码 → 名字数据被加密（需要专门解密）
-///    - 某个候选内偏移能对上         → FNamePool 布局与 stock 不同
-/// 2) 依次尝试常见 Blocks 内偏移，GWorld 名与 entry0 都能解码则采纳并继续 dump。
-///    返回 YES 表示已自适应成功（调用方可继续）。
+/// GNames 自检失败时的深度诊断（ShadowTracker 的布局与 stock UE 差异较大：
+/// pool 头部直接就是指针数组，且目标内容仍是指针——至少两级间接）。
+/// 采集足以离线定位布局的数据：
+///   ① GWorld 头 0x40 字节 → 确定 vtable / FName / Class 的真实位置
+///   ② pool 头 0x40 字节
+///   ③ 两级指针追踪：pool[i] → 目标 → 再解引用 → 内容（ASCII 可读 = 名字数据层）
+///   ④ 按当前 NameIdx 候选直接试探目标条目（blocks@+0x00 假设）
+///   ⑤ 保留 stock 布局自适应尝试（对其他游戏仍有效）
 static bool ud_gnames_diagnose(void) {
-    UD_LOG_ERROR("── GNames 诊断开始 ──");
-    UD_LOG("pool=0x%llx GWorld: NameIdx=0x%x Number=0x%x InternalIndex=0x%x",
-           (unsigned long long)gGNames,
-           ud_kread32(gGWorld + UE.uobjName), ud_kread32(gGWorld + UE.uobjName + 4),
-           ud_kread32(gGWorld + UE.uobjIndex));
-    for (int i = 0; i < 6; i++) {
-        UD_LOG("pool+0x%02x = 0x%016llx", i * 8,
-               (unsigned long long)ud_kread64(gGNames + (uint64_t)i * 8));
+    UD_LOG_ERROR("── GNames 深度诊断开始 ──");
+
+    // ① GWorld 头部：找 vtable / FName / Class 真实位置
+    ud_dump_hex_ascii("①GWorld+0x00", gGWorld, 64);
+
+    // ② pool 头部
+    ud_dump_hex_ascii("②pool+0x00", gGNames, 64);
+
+    // ③ 两级指针追踪（上次漏了 pool+0x00 的目标——那可能才是第一个名字块）
+    for (int i = 0; i < 4; i++) {
+        uint64_t p1 = ud_kread64(gGNames + (uint64_t)i * 8);
+        if (!ud_userland(p1)) continue;
+        char tag1[64];
+        snprintf(tag1, sizeof(tag1), "③pool[%d]目标", i);
+        ud_dump_hex_ascii(tag1, p1, 32);
+        for (int j = 0; j < 2; j++) {
+            uint64_t p2 = ud_kread64(p1 + (uint64_t)j * 8);
+            if (!ud_userland(p2)) continue;
+            char tag2[80];
+            snprintf(tag2, sizeof(tag2), "③pool[%d][%d]二层目标", i, j);
+            ud_dump_hex_ascii(tag2, p2, 32);
+        }
     }
 
-    static const uint32_t kInners[] = {0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40, 0x50, 0x60, 0x80, 0xC0};
+    // ④ NameIdx 候选（若 name@+0x08 成立）按 blocks@+0x00 直取试探
     uint32_t widx = ud_kread32(gGWorld + UE.uobjName);
+    UD_LOG("④NameIdx候选=0x%x（block 0x%x + off 0x%x）", widx, widx >> 16, widx & 0xFFFF);
+    uint64_t blk = ud_kread64(gGNames + (uint64_t)(widx >> 16) * 8);
+    if (ud_userland(blk)) {
+        ud_dump_hex_ascii("④目标block头", blk, 32);
+        ud_dump_hex_ascii("④目标entry", blk + (widx & 0xFFFF), 32);
+    }
+
+    // ⑤ stock 布局自适应（对未定制引擎仍有效）
+    static const uint32_t kInners[] = {0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40, 0x50, 0x60, 0x80, 0xC0};
     for (size_t k = 0; k < sizeof(kInners) / sizeof(kInners[0]); k++) {
         uint32_t inner = kInners[k];
-        uint64_t b0 = ud_kread64(gGNames + inner);
-        if (!ud_userland(b0)) continue;
-        UD_LOG("候选 Blocks@+0x%02x：blocks[0]=0x%llx 首16字节：%@",
-               inner, (unsigned long long)b0, ud_hex16(b0));
-
-        // 双重校验：GWorld 的名字与 entry0（stock UE 里第一个名字是 "None"）
         char n1[256], n2[256];
         if (ud_name_try_inner(inner, widx, n1, sizeof(n1)) &&
             ud_name_try_inner(inner, 0, n2, sizeof(n2))) {
             gBlocksOff = inner;
-            UD_LOG("→ 该候选可解码：GWorld 名=%s，entry0=%s（采用 Blocks@+0x%02x，继续 dump）",
-                   n1, n2, inner);
+            UD_LOG("→ 自适应命中：GWorld 名=%s，entry0=%s（Blocks@+0x%02x）", n1, n2, inner);
             UD_LOG_ERROR("── GNames 诊断结束：布局已自适应 ──");
             return true;
         }
     }
-    UD_LOG_ERROR("── GNames 诊断结束：所有候选均失败——把上面整段日志发回分析 ──");
+
+    UD_LOG_ERROR("── GNames 深度诊断结束：把上面整段日志（含 hex/asc）发回分析 ──");
     return false;
 }
 
