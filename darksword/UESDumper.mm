@@ -117,7 +117,7 @@ static struct {
     0x11FBA198,  // offGNames
     0,           // offGObjects：自动扫描
 
-    0x0C, 0x10, 0x18, 0x08, // UObject
+    0x08, 0x10, 0x18, 0x04, // UObject（NamePrivate@0x08 Class@0x10 Outer@0x18 InternalIndex@0x04）
 
     0x20, 0x28, 0x30, 0x38, 0x40, // UStruct
 
@@ -222,13 +222,15 @@ static bool ud_userland(uint64_t p) { return p >= 0x100000000ULL && p < 0x800000
 // FNamePool { Lock(8) CurrentBlock(4) CurrentByteCursor(4) Blocks[8192] }
 // Block 大小 0x10000；Entry { uint16 头(低1位wide, 高15位长度) char 数据[] }
 static uint64_t gGNames = 0;
+static uint32_t gBlocksOff = 0x10; // FNamePool 内 Blocks 数组偏移（诊断可自适应修正）
 
-static bool ud_name_from_index(uint32_t idx, char *out, size_t cap) {
+// 按指定 Blocks 内偏移尝试解析名字（诊断/自适应用）
+static bool ud_name_try_inner(uint32_t inner, uint32_t idx, char *out, size_t cap) {
     if (!gGNames || !out || cap == 0) return false;
     uint32_t block = idx >> 16;
     uint32_t off = idx & 0xFFFF;
     if (block >= 8192) return false;
-    uint64_t blockPtr = ud_kread64(gGNames + 0x10 + (uint64_t)block * 8);
+    uint64_t blockPtr = ud_kread64(gGNames + inner + (uint64_t)block * 8);
     if (!ud_userland(blockPtr)) return false;
     uint16_t header = ud_kread16(blockPtr + off);
     size_t len = header >> 1;
@@ -253,6 +255,10 @@ static bool ud_name_from_index(uint32_t idx, char *out, size_t cap) {
         if (c < 0x20 || c > 0x7E) return false;
     }
     return true;
+}
+
+static bool ud_name_from_index(uint32_t idx, char *out, size_t cap) {
+    return ud_name_try_inner(gBlocksOff, idx, out, cap);
 }
 
 // 名字缓存：槽位带 idx 键（命中才用），保证不因哈希冲突串名
@@ -337,6 +343,57 @@ static void ud_fail(NSString *msg) {
 // ============================================================
 static uint64_t gBase = 0, gGWorld = 0, gGObjects = 0;
 
+// 指定地址起 16 字节的十六进制串（诊断用）
+static NSString *ud_hex16(uint64_t addr) {
+    uint8_t b[16];
+    if (!ud_kreadbuf(addr, b, sizeof(b))) return @"<读取失败>";
+    NSMutableString *s = [NSMutableString string];
+    for (int i = 0; i < 16; i++) [s appendFormat:@"%02x ", b[i]];
+    return s;
+}
+
+/// GNames 自检失败时的诊断 + 自适应：
+/// 1) 打印名字池头部原始内存——离线区分「offGNames 错 / 布局不符 / 名字加密」：
+///    - pool 头部本身像随机值        → offGNames 有误
+///    - blocks[0] 指向的 16 字节乱码 → 名字数据被加密（需要专门解密）
+///    - 某个候选内偏移能对上         → FNamePool 布局与 stock 不同
+/// 2) 依次尝试常见 Blocks 内偏移，GWorld 名与 entry0 都能解码则采纳并继续 dump。
+///    返回 YES 表示已自适应成功（调用方可继续）。
+static bool ud_gnames_diagnose(void) {
+    UD_LOG_ERROR("── GNames 诊断开始 ──");
+    UD_LOG("pool=0x%llx GWorld: NameIdx=0x%x Number=0x%x InternalIndex=0x%x",
+           (unsigned long long)gGNames,
+           ud_kread32(gGWorld + UE.uobjName), ud_kread32(gGWorld + UE.uobjName + 4),
+           ud_kread32(gGWorld + UE.uobjIndex));
+    for (int i = 0; i < 6; i++) {
+        UD_LOG("pool+0x%02x = 0x%016llx", i * 8,
+               (unsigned long long)ud_kread64(gGNames + (uint64_t)i * 8));
+    }
+
+    static const uint32_t kInners[] = {0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40, 0x50, 0x60, 0x80, 0xC0};
+    uint32_t widx = ud_kread32(gGWorld + UE.uobjName);
+    for (size_t k = 0; k < sizeof(kInners) / sizeof(kInners[0]); k++) {
+        uint32_t inner = kInners[k];
+        uint64_t b0 = ud_kread64(gGNames + inner);
+        if (!ud_userland(b0)) continue;
+        UD_LOG("候选 Blocks@+0x%02x：blocks[0]=0x%llx 首16字节：%@",
+               inner, (unsigned long long)b0, ud_hex16(b0));
+
+        // 双重校验：GWorld 的名字与 entry0（stock UE 里第一个名字是 "None"）
+        char n1[256], n2[256];
+        if (ud_name_try_inner(inner, widx, n1, sizeof(n1)) &&
+            ud_name_try_inner(inner, 0, n2, sizeof(n2))) {
+            gBlocksOff = inner;
+            UD_LOG("→ 该候选可解码：GWorld 名=%s，entry0=%s（采用 Blocks@+0x%02x，继续 dump）",
+                   n1, n2, inner);
+            UD_LOG_ERROR("── GNames 诊断结束：布局已自适应 ──");
+            return true;
+        }
+    }
+    UD_LOG_ERROR("── GNames 诊断结束：所有候选均失败——把上面整段日志发回分析 ──");
+    return false;
+}
+
 static bool ud_attach_game(void) {
     if (gPageShift == 0) {
         vm_size_t ps = 0;
@@ -392,10 +449,14 @@ static bool ud_attach_game(void) {
     char nameBuf[256];
     uint32_t wnameIdx = ud_kread32(gGWorld + UE.uobjName);
     if (!ud_name_from_index(wnameIdx, nameBuf, sizeof(nameBuf))) {
-        ud_fail(@"GNames 名字解析失败（FNamePool 布局或 offGNames 可能不符）");
-        return false;
+        // stock 布局解析失败：先诊断（可能自动适配成功），不行才报错
+        if (!ud_gnames_diagnose()) {
+            ud_fail(@"GNames 名字解析失败（详见上方诊断日志：offGNames 有误 / 布局不符 / 名字加密）");
+            return false;
+        }
+    } else {
+        UD_LOG("GNames OK（GWorld 对象名 = %s）", nameBuf);
     }
-    UD_LOG("GNames OK（GWorld 对象名 = %s）", nameBuf);
     return true;
 }
 
