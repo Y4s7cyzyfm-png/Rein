@@ -146,6 +146,7 @@ static NSString * const kUDGObjectsOffKey = @"rein.uesdumper.gobjectsOff";
 
 static uint64_t gVMMap = 0;
 static int gPageShift = 0;
+static long gUDMapFail = 0; // 页映射失败计数（内核通道不稳时读全零，必漏）
 
 #define UD_PAGE_CACHE_CAP 4096 // 64MB 热窗口（16KB 页）
 typedef struct { uint64_t remotePage; uint64_t localPage; } UDPageSlot;
@@ -205,9 +206,10 @@ static uint64_t ud_map_remote_page(uint64_t remotePage) {
     @try {
         sh = vmmapremotepage(gVMMap, remotePage);
     } @catch (NSException *exception) {
+        gUDMapFail++; // 内核通道异常（计数供扫描结束时汇总提示）
         return 0; // 当作不可映射处理
     }
-    if (!sh.used || !sh.localAddress) return 0;
+    if (!sh.used || !sh.localAddress) { gUDMapFail++; return 0; }
     ud_page_cache_put(remotePage, sh.localAddress);
     return sh.localAddress;
 }
@@ -541,11 +543,10 @@ static bool ud_attach_game(void) {
 // GUObjectArray 定位（组合候选自适应 + 自动扫描，找到后记忆）
 // ============================================================
 // 布局候选（iOS_UEDumper 公式 + 真机适配 + 反 dump 改版兜底）：
-//   ObjObjects 内偏移 ∈ {0x00, 0x10}；Num 偏移 ∈ {0x08, 0x0C, 0x14}；
-//   Max 取 Num 的前/后邻槽之一（兼容 Num/Max 互换的改版）；
-//   每 chunk 元素数 ∈ {64, 8192, 65536} 或平铺（非 chunk，UE4.18/19）；
-//   FUObjectItem 步长 ∈ {0x18, 0x20}，Object 槽内偏移 ∈ {0x00, 0x08}
-//   （防游戏在 item 头部加填充的反 dump 改版）。
+//   ObjObjects 内偏移 / Num 偏移 / chunk 元素数 / item 步长 / 槽内偏移
+//   全维候选（见下方 gUD* 表）。第三轮真机证据：该游戏 GNames 为定制
+//   容器（16384 条目/块 × 每条目 8B 指针），GUObjectArray 很可能同风格
+//   ——纯指针数组（stride=8）/ 16384 条目块（shift=14）均纳入候选。
 // 确认法（双锚点，任一命中即真）：
 //   主锚点 = 已知 GWorld 的 InternalIndex 反查数组，指针精确相等，
 //   且数组尾部有合法 UObject（防 Num 槽位误中）；
@@ -560,8 +561,16 @@ static struct {
     bool weakAnchor;    // true = 次锚点命中（主锚点未中，InternalIndex 可能被改）
 } gOA = { 0x10, 0x14, 16, 0x18, 0x00, false };
 
+// 候选空间（确认与扫描预筛共用）
+static const uint32_t gUDInner[]  = { 0x10, 0x00, 0x08, 0x18, 0x20 };
+static const uint32_t gUDNum[]    = { 0x14, 0x0C, 0x08, 0x10, 0x18 };
+static const int      gUDShift[]  = { 16, 14, 13, 6, 0 }; // 0 = 平铺
+static const uint32_t gUDStride[] = { 0x18, 0x20, 0x08 };
+static const uint32_t gUDObjOff[] = { 0x00, 0x08 };
+#define UD_ARR_LEN(a) (sizeof(a) / sizeof((a)[0]))
+
 static int gUDNearMiss = 0;           // 近失候选日志配额（扫描未命中时供离线分析布局）
-static uint64_t gUDNearMissLastV = 0; // 去重：同 V 的 96 种组合只记一条
+static uint64_t gUDNearMissLastV = 0; // 去重：同 V 的全部组合只记一条
 
 static const char *ud_oa_desc(void) {
     static char buf[80];
@@ -640,10 +649,12 @@ static int ud_oa_try(uint64_t V, uint32_t gworldIdx, uint64_t gworld,
             }
         }
     }
-    // 近失诊断（限量 + 同 V 去重；Num 已限界，能到这里的都是形似候选）
+    // 近失诊断（限量 + 同 V 去重；Num 已限界，能到这里的都是形似候选）。
+    // 前 6 个附带 hex dump——直接把候选结构原始字节发回日志，离线定布局。
     if (gUDNearMiss < 16 && V != gUDNearMissLastV) {
         UD_LOG("近失候选 base+0x%llx（Obj@+0x%x Num@+0x%x：Num=%d）",
                (unsigned long long)(V - gBase), innerOff, numOff, numE);
+        if (gUDNearMiss < 6) ud_dump_hex_ascii("近失hex", V, 0x40);
         gUDNearMissLastV = V;
         gUDNearMiss++;
     }
@@ -651,24 +662,19 @@ static int ud_oa_try(uint64_t V, uint32_t gworldIdx, uint64_t gworld,
 }
 
 static bool ud_gobjects_confirms(uint64_t V, uint32_t gworldIdx, uint64_t gworld) {
-    static const uint32_t kInner[] = { 0x10, 0x00 };
-    static const uint32_t kNum[] = { 0x14, 0x0C, 0x08 };
-    static const int kShift[] = { 16, 13, 6, 0 }; // 0 = UE4.18/19 平铺数组
-    static const uint32_t kStride[] = { 0x18, 0x20 };
-    static const uint32_t kObjOff[] = { 0x00, 0x08 };
-    for (size_t a = 0; a < sizeof(kInner) / sizeof(kInner[0]); a++) {
-        for (size_t b = 0; b < sizeof(kNum) / sizeof(kNum[0]); b++) {
-            for (size_t c = 0; c < sizeof(kShift) / sizeof(kShift[0]); c++) {
-                for (size_t d = 0; d < sizeof(kStride) / sizeof(kStride[0]); d++) {
-                    for (size_t e = 0; e < sizeof(kObjOff) / sizeof(kObjOff[0]); e++) {
-                        int hit = ud_oa_try(V, gworldIdx, gworld, kInner[a], kNum[b],
-                                            kShift[c], kStride[d], kObjOff[e]);
+    for (size_t a = 0; a < UD_ARR_LEN(gUDInner); a++) {
+        for (size_t b = 0; b < UD_ARR_LEN(gUDNum); b++) {
+            for (size_t c = 0; c < UD_ARR_LEN(gUDShift); c++) {
+                for (size_t d = 0; d < UD_ARR_LEN(gUDStride); d++) {
+                    for (size_t e = 0; e < UD_ARR_LEN(gUDObjOff); e++) {
+                        int hit = ud_oa_try(V, gworldIdx, gworld, gUDInner[a], gUDNum[b],
+                                            gUDShift[c], gUDStride[d], gUDObjOff[e]);
                         if (hit) {
-                            gOA.innerOff = kInner[a];
-                            gOA.numOff = kNum[b];
-                            gOA.chunkShift = kShift[c];
-                            gOA.itemStride = kStride[d];
-                            gOA.itemObjOff = kObjOff[e];
+                            gOA.innerOff = gUDInner[a];
+                            gOA.numOff = gUDNum[b];
+                            gOA.chunkShift = gUDShift[c];
+                            gOA.itemStride = gUDStride[d];
+                            gOA.itemObjOff = gUDObjOff[e];
                             gOA.weakAnchor = (hit == 2);
                             return true;
                         }
@@ -707,12 +713,6 @@ static int32_t ud_uobject_count(void) {
 
 #define UD_MAX_SECTS 96
 typedef struct { uint64_t addr, size; char name[32]; } UDSect;
-
-// 本地预筛的 Num 槽位表：[inner 0x10 / 0x00][numOff 0x14 / 0x0C / 0x08]
-static const uint32_t gUDNumSlot[2][3] = {
-    { 0x24, 0x1C, 0x18 },  // innerOff = 0x10
-    { 0x14, 0x0C, 0x08 },  // innerOff = 0x00
-};
 
 static int ud_collect_data_sections(UDSect *out, int cap) {
     uint8_t hdr[32];
@@ -795,20 +795,27 @@ static int ud_collect_data_sections(UDSect *out, int cap) {
     }
     free(cmds);
 
-    // 按距 GNames 全局的距离升序（插入排序；近似优先，覆盖不受影响）
-    const uint64_t anchor = gBase + UE.offGNames;
+    // 按「距 GNames / GWorld 两个已验证全局的最小距离」升序（插入排序；
+    // 近似优先，覆盖不受影响）。第三轮真机：GWorld 在 __common、GNames 在
+    // __bss——GUObjectArray 通常与二者之一链接相邻，这两段最先扫。
+    const uint64_t anchorA = gBase + UE.offGNames;
+    const uint64_t anchorB = gBase + UE.offGWorld;
+#define UD_DIST_TO_ANCHORS(s) ({ \
+    uint64_t _da = ((s).addr > anchorA) ? ((s).addr - anchorA) : (anchorA - (s).addr); \
+    uint64_t _db = ((s).addr > anchorB) ? ((s).addr - anchorB) : (anchorB - (s).addr); \
+    (_da < _db) ? _da : _db; })
     for (int i = 1; i < count; i++) {
         UDSect key = out[i];
-        uint64_t kd = (key.addr > anchor) ? (key.addr - anchor) : (anchor - key.addr);
+        uint64_t kd = UD_DIST_TO_ANCHORS(key);
         int j = i - 1;
         while (j >= 0) {
-            uint64_t d = (out[j].addr > anchor) ? (out[j].addr - anchor) : (anchor - out[j].addr);
-            if (d <= kd) break;
+            if (UD_DIST_TO_ANCHORS(out[j]) <= kd) break;
             out[j + 1] = out[j];
             j--;
         }
         out[j + 1] = key;
     }
+#undef UD_DIST_TO_ANCHORS
     return count;
 }
 
@@ -824,24 +831,25 @@ static bool ud_scan_range_for_gobjects(uint64_t scanLo, uint64_t scanHi,
 
     vmmapiterateentries(gVMMap, ^(uint64_t start, uint64_t end, uint64_t entry, BOOL *stop) {
         if (found || end <= scanLo || start >= scanHi) return;
+        // 页起点钳制到 scanLo：否则会从 VM entry 起点开始扫（窗口外的
+        // 区域重复扫——上轮日志里 __bss 阶段扫到 __common 的近失即此原因）
         uint64_t page = start & ~0x3FFFULL;
+        if (page < scanLo) page = scanLo & ~0x3FFFULL;
         for (; page < end && page < scanHi; page += 0x4000ULL) {
             // 整段 16K 批量读（坏页置零）；本地预筛后再做完整确认
             ud_kread_best_effort(page, scanBuf, 0x4000);
             for (uint64_t o = 0; o + 0x18 <= 0x4000ULL; o += 8) {
                 uint64_t V = page + o; // 候选 GUObjectArray
-                if (o + 0x30 <= 0x4000ULL) {
-                    // 本地预筛：+0x10/+0x00 之一是宽指针，且某个 Num 槽位组合形似合理
-                    uint64_t p10, p00;
-                    memcpy(&p10, scanBuf + o + 0x10, 8);
-                    memcpy(&p00, scanBuf + o, 8);
-                    bool w10 = ud_ptr_wide(p10), w00 = ud_ptr_wide(p00);
-                    if (!w10 && !w00) continue;
+                if (o + 0x38 <= 0x4000ULL) {
+                    // 本地预筛（与 ud_oa_try 廉价检查等价，不产生额外内核往返）：
+                    // 某 inner 槽位是宽指针，且对应某 Num 槽位组合形似合理
                     bool plausible = false;
-                    for (int a = 0; a < 2 && !plausible; a++) {
-                        if ((a == 0) ? !w10 : !w00) continue;
-                        for (int b = 0; b < 3 && !plausible; b++) {
-                            uint32_t slot = gUDNumSlot[a][b];
+                    for (size_t a = 0; a < UD_ARR_LEN(gUDInner) && !plausible; a++) {
+                        uint64_t p;
+                        memcpy(&p, scanBuf + o + gUDInner[a], 8);
+                        if (!ud_ptr_wide(p)) continue;
+                        for (size_t b = 0; b < UD_ARR_LEN(gUDNum) && !plausible; b++) {
+                            uint32_t slot = gUDInner[a] + gUDNum[b];
                             uint32_t numE, mx0, mx1;
                             memcpy(&numE, scanBuf + o + slot, 4);
                             memcpy(&mx0, scanBuf + o + slot - 4, 4);
@@ -894,14 +902,23 @@ static bool ud_find_gobjects(void) {
     }
 
     // ---- 扫描定位 ----
-    // 首选：远程解析主映像 Mach-O，逐 section 扫描全部 __DATA* 段（含
-    // __bss/__common——GUObjectArray 全局可能在任一数据 section），
-    // 按「距 GNames 全局的距离」从近到远扫；解析失败回退 GNames 窗口。
+    // 第 0 优先：GWorld 全局附近 ±1MB——GUObjectArray/GEngine 通常与其
+    // 链接相邻（第三轮真机：GWorld 在 __common，旧排序里该段第二个才扫、
+    // 扫到一半日志就截断了；先扫它周边，最快命中）。
     uint64_t found = 0;
+    const uint64_t gwAbs = gBase + UE.offGWorld;
+    UD_LOG("优先扫描 GWorld 全局附近 [0x%llx, 0x%llx)…",
+           (unsigned long long)(gwAbs - 0x100000), (unsigned long long)(gwAbs + 0x100000));
+    ud_scan_range_for_gobjects(gwAbs - 0x100000, gwAbs + 0x100000,
+                               gworldIdx, gGWorld, &found);
+
+    // 第 1 优先：远程解析主映像 Mach-O，逐 section 扫描全部 __DATA* 段（含
+    // __bss/__common——GUObjectArray 全局可能在任一数据 section），
+    // 按「距 GNames / GWorld 全局的最小距离」从近到远扫；解析失败回退窗口。
     UDSect sects[UD_MAX_SECTS];
     int nSects = ud_collect_data_sections(sects, UD_MAX_SECTS);
     if (nSects > 0) {
-        UD_LOG("主映像解析到 %d 个 __DATA* section（按距 GNames 距离近 → 远）", nSects);
+        UD_LOG("主映像解析到 %d 个 __DATA* section（按距 GNames/GWorld 距离近 → 远）", nSects);
         for (int i = 0; i < nSects && !found; i++) {
             UD_LOG("扫描 %s [0x%llx, 0x%llx)（%llu MB）…",
                    sects[i].name,
@@ -911,7 +928,7 @@ static bool ud_find_gobjects(void) {
             ud_scan_range_for_gobjects(sects[i].addr, sects[i].addr + sects[i].size,
                                        gworldIdx, gGWorld, &found);
         }
-    } else {
+    } else if (!found) {
         UD_LOG("Mach-O section 解析失败，回退 GNames 附近窗口扫描");
         const uint64_t scanLoOff = (UE.offGNames > 0x4000000) ? (UE.offGNames - 0x4000000) : 0;
         const uint64_t scanHiOff = (uint64_t)UE.offGNames + 0x2000000;
@@ -922,6 +939,10 @@ static bool ud_find_gobjects(void) {
                                    gworldIdx, gGWorld, &found);
     }
     ud_page_cache_flush(); // 扫描产生大量一次性映射，回收
+    if (gUDMapFail > 0) {
+        UD_LOG("页映射失败 %ld 次（内核通道不稳时读到全零，可能漏掉真身——建议重跑）",
+               gUDMapFail);
+    }
 
     if (!found) {
         ud_fail(@"GUObjectArray 自动扫描未命中（已扫全部 __DATA section）——把控制台日志发回分析，或手动填 UE.offGObjects");
@@ -1364,7 +1385,7 @@ void UESDumperStart(void) {
     gNameIndexMode = 1;
     gOA.innerOff = 0x10; gOA.numOff = 0x14; gOA.chunkShift = 16;
     gOA.itemStride = 0x18; gOA.itemObjOff = 0; gOA.weakAnchor = false;
-    gUDNearMiss = 0; gUDNearMissLastV = 0;
+    gUDNearMiss = 0; gUDNearMissLastV = 0; gUDMapFail = 0;
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
