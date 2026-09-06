@@ -191,7 +191,7 @@ static uint64_t ud_map_remote_page(uint64_t remotePage) {
     struct vmshmem sh = vmmapremotepage(gVMMap, remotePage);
     if (!sh.used || !sh.localAddress) return 0;
     ud_page_cache_put(remotePage, sh.localAddress);
-    return sh.localPage;
+    return sh.localAddress;
 }
 
 static bool ud_kreadbuf(uint64_t va, void *out, size_t sz) {
@@ -356,8 +356,10 @@ static bool ud_attach_game(void) {
     UD_LOG("vm_map=0x%llx", (unsigned long long)gVMMap);
 
     // 基址扫描：窗口内 Mach-O 条目 + base+offGWorld 双重校验（同 PeaceESP）
+    // block 按值捕获 C 数组且为只读——用堆缓冲 + 指针捕获（PeaceESP 同款做法）
     typedef struct { uint64_t start, end; } UDMapCand;
-    UDMapCand cand[128];
+    UDMapCand *cand = (UDMapCand *)calloc(128, sizeof(UDMapCand));
+    if (!cand) { ud_fail(@"内存不足（候选条目缓冲）"); return false; }
     __block int n = 0;
     vmmapiterateentries(gVMMap, ^(uint64_t start, uint64_t end, uint64_t entry, BOOL *stop) {
         if (n >= 128) { *stop = YES; return; }
@@ -377,6 +379,7 @@ static bool ud_attach_game(void) {
         if (!ud_userland(hop1)) continue;
         gBase = cand[i].start;
     }
+    free(cand);
     if (!gBase) { ud_fail(@"未找到主映像基址（base+offGWorld 校验全灭，offGWorld 可能过期）"); return false; }
     UD_LOG("base=0x%llx", (unsigned long long)gBase);
 
