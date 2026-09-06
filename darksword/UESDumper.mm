@@ -191,7 +191,14 @@ static void ud_page_cache_put(uint64_t remotePage, uint64_t localPage) {
 static uint64_t ud_map_remote_page(uint64_t remotePage) {
     uint64_t local = ud_page_cache_get(remotePage);
     if (local) return local;
-    struct vmshmem sh = vmmapremotepage(gVMMap, remotePage);
+    // 内核层对坏页会抛 ObjC 异常（set_target_kaddr）——扫描阶段会对任意
+    // 候选地址探测，必须兜住，否则一个坏页就崩掉整个 App
+    struct vmshmem sh;
+    @try {
+        sh = vmmapremotepage(gVMMap, remotePage);
+    } @catch (NSException *exception) {
+        return 0; // 当作不可映射处理
+    }
     if (!sh.used || !sh.localAddress) return 0;
     ud_page_cache_put(remotePage, sh.localAddress);
     return sh.localAddress;
@@ -215,6 +222,27 @@ static bool ud_kreadbuf(uint64_t va, void *out, size_t sz) {
 
 static uint64_t ud_kread64(uint64_t va) { uint64_t v = 0; ud_kreadbuf(va, &v, 8); return v; }
 static uint32_t ud_kread32(uint64_t va) { uint32_t v = 0; ud_kreadbuf(va, &v, 4); return v; }
+
+// 区域批量读（扫描用）：逐页拷贝、页大小自适应、坏页置零跳过。
+// 与 ud_kreadbuf 的区别：不受单页大小上限约束，尽力读完整个区域。
+static void ud_kread_best_effort(uint64_t va, void *out, size_t sz) {
+    uint64_t ps = ud_page_size();
+    size_t done = 0;
+    while (done < sz) {
+        uint64_t cur = va + done;
+        uint64_t page = cur & ~(ps - 1);
+        uint64_t off = cur - page;
+        size_t chunk = (size_t)(ps - off);
+        if (chunk > sz - done) chunk = sz - done;
+        uint64_t local = ud_map_remote_page(page);
+        if (local) {
+            memcpy((char *)out + done, (const void *)(local + off), chunk);
+        } else {
+            memset((char *)out + done, 0, chunk); // 坏页置零（qword 预筛会跳过）
+        }
+        done += chunk;
+    }
+}
 
 static bool ud_userland(uint64_t p) { return p >= 0x100000000ULL && p < 0x800000000ULL; }
 
@@ -591,23 +619,31 @@ static bool ud_find_gobjects(void) {
            (unsigned long long)((scanHi - scanLo) >> 20));
 
     __block uint64_t found = 0;
-    vmmapiterateentries(gVMMap, ^(uint64_t start, uint64_t end, uint64_t entry, BOOL *stop) {
-        if (found || end <= scanLo || start >= scanHi) return;
-        uint64_t page = start & ~0x3FFFULL;
-        for (; page < end && page < scanHi; page += 0x4000ULL) {
-            uint64_t local = ud_map_remote_page(page);
-            if (!local) continue;
-            for (uint64_t o = 0; o < 0x4000ULL; o += 8) {
-                uint64_t V = page + o; // 候选 GUObjectArray（须在映像内）
-                if (!ud_userland(V)) continue;
-                if (ud_gobjects_confirms(V, gworldIdx, gGWorld)) {
-                    found = V;
-                    *stop = YES;
-                    return;
+    __block uint8_t *scanBuf = (uint8_t *)malloc(0x4000);
+    if (scanBuf) {
+        vmmapiterateentries(gVMMap, ^(uint64_t start, uint64_t end, uint64_t entry, BOOL *stop) {
+            if (found || end <= scanLo || start >= scanHi) return;
+            uint64_t page = start & ~0x3FFFULL;
+            for (; page < end && page < scanHi; page += 0x4000ULL) {
+                // 整段 16K 批量读（坏页置零）；逐字节本地预筛后再做完整确认
+                ud_kread_best_effort(page, scanBuf, 0x4000);
+                for (uint64_t o = 0; o + 0x18 <= 0x4000ULL; o += 8) {
+                    uint64_t V = page + o; // 候选 GUObjectArray
+                    // 预筛：ObjObjects 指针（+0x10 / +0x00）之一须是游戏用户态指针
+                    uint64_t p10, p00;
+                    memcpy(&p10, scanBuf + o + 0x10, 8);
+                    memcpy(&p00, scanBuf + o, 8);
+                    if (!ud_userland(p10) && !ud_userland(p00)) continue;
+                    if (ud_gobjects_confirms(V, gworldIdx, gGWorld)) {
+                        found = V;
+                        *stop = YES;
+                        return;
+                    }
                 }
             }
-        }
-    });
+        });
+        free(scanBuf);
+    }
     ud_page_cache_flush(); // 扫描产生大量一次性映射，回收
 
     if (!found) {
@@ -861,8 +897,14 @@ static bool ud_dump_all(NSString *outDir) {
         uint64_t item = ud_uobject_at((uint32_t)i);
         if (!ud_userland(item)) continue;
 
+        // 类名先拷贝到本地缓冲：ud_obj_name 返回循环缓冲，
+        // 后面 ud_full_path 会再次调用它（链上最多 10 次）导致覆盖串名
         uint64_t cls = ud_kread64(item + UE.uobjClass);
-        const char *cn = ud_userland(cls) ? ud_obj_name(cls) : NULL;
+        char cnBuf[352] = "";
+        const char *cnRaw = ud_userland(cls) ? ud_obj_name(cls) : NULL;
+        if (cnRaw) snprintf(cnBuf, sizeof(cnBuf), "%s", cnRaw);
+        const char *cn = cnBuf[0] ? cnBuf : NULL;
+
         char path[512];
         ud_full_path(item, path, sizeof(path));
         if (!path[0]) continue;
@@ -964,17 +1006,21 @@ void UESDumperStart(void) {
         @autoreleasepool {
             UD_LOG("=== UE4 SDK dump 开始（内核读，无需注入/RemoteCall）===");
 
-            if (!ReinKernelIsReady()) {
-                ud_fail(@"请先在「内核」页初始化 DarkSword 内核");
-                gUDRunning = false;
-                return;
+            BOOL ok = NO;
+            NSString *outDir = @"";
+            @try {
+                if (!ReinKernelIsReady()) {
+                    ud_fail(@"请先在「内核」页初始化 DarkSword 内核");
+                } else if (ud_attach_game() && ud_find_gobjects()) {
+                    outDir = [NSHomeDirectory()
+                        stringByAppendingPathComponent:@"Documents/SDK"];
+                    ok = ud_dump_all(outDir);
+                }
+            } @catch (NSException *exception) {
+                // 顶层兜底：内核层任何未预期的异常都不允许崩掉 App
+                ud_fail([NSString stringWithFormat:@"Dump 异常：%@（%@）",
+                         exception.name, exception.reason]);
             }
-            if (!ud_attach_game()) { gUDRunning = false; return; }
-            if (!ud_find_gobjects()) { gUDRunning = false; return; }
-
-            NSString *outDir = [NSHomeDirectory()
-                stringByAppendingPathComponent:@"Documents/SDK"];
-            BOOL ok = ud_dump_all(outDir);
 
             ud_page_cache_flush();
             ud_name_cache_free();
