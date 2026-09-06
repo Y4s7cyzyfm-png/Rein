@@ -23,8 +23,9 @@
 //      chunk 元素数 1<<{16,13,6} 或 UE4.18/19 旧式平铺数组；item 步长
 //      ∈ {0x18, 0x20}、Object 槽内偏移 ∈ {0x00, 0x08}（反 dump 改版兜底）。
 //      主锚点 = GWorld 的 InternalIndex 反查指针相等；次锚点 = 头/尾整排
-//      合法 UObject（不依赖 InternalIndex，防字段偏移被改）。扫描范围由
-//      远程解析主映像 Mach-O 的 __DATA* 各 section 决定（含 __bss）。
+//      合法 UObject（不依赖 InternalIndex，防字段偏移被改）。首选值扫描
+//      （堆里搜 GWorld 槽位反推数组再反查全局指针），回退为远程解析主映像
+//      Mach-O 的 __DATA* 各 section 逐段扫描（含 __bss）。
 //  - UStruct 代际（4.18 / 4.20-22 / 4.23+）在运行时用「World 的
 //    SuperStruct 类名必须是 Object」锚点校准，防止旧引擎游戏用 4.25
 //    公式生成出错误 SDK。
@@ -569,8 +570,9 @@ static const uint32_t gUDStride[] = { 0x18, 0x20, 0x08 };
 static const uint32_t gUDObjOff[] = { 0x00, 0x08 };
 #define UD_ARR_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
-static int gUDNearMiss = 0;           // 近失候选日志配额（扫描未命中时供离线分析布局）
+static int gUDNearMiss = 0;           // 高价值近失日志配额（Num ≥ gworldIdx/2 才记）
 static uint64_t gUDNearMissLastV = 0; // 去重：同 V 的全部组合只记一条
+static long gUDNearMissJunk = 0;      // 低价值近失计数（字节花纹垃圾，仅汇总）
 
 static const char *ud_oa_desc(void) {
     static char buf[80];
@@ -603,10 +605,37 @@ static bool ud_is_named_uobject(uint64_t obj) {
     return ud_obj_name(c) != NULL;
 }
 
-// 返回 0=未中 1=主锚点 2=次锚点
+// ---- 组合确认的读缓存（memo）----
+// 同一候选 V 的全部组合里，数组槽位读取只依赖 (inner, shift, stride,
+// objOff) 四个维度——按候选表索引缓存后，每个 V 的内核往返从上千次降到
+// 最多 ~150 次（第四轮真机实测：__common 4MB 扫 9 分钟即此瓶颈）。
+#define UD_MEMO_IDX_GW 8 // item 槽位下标：0..7 = 头部 idx，8 = gworldIdx
+typedef struct {
+    uint64_t V;
+    uint64_t item[5][5][3][2][9];
+    bool set[5][5][3][2][9];
+} UDOAMemo;
+static UDOAMemo gOAMemo;
+
+static uint64_t ud_memo_item(uint64_t V, uint64_t objects, uint32_t gworldIdx,
+                             size_t a, size_t c, size_t d, size_t e, uint32_t idxSlot) {
+    if (gOAMemo.V != V) {
+        memset(gOAMemo.set, 0, sizeof(gOAMemo.set));
+        gOAMemo.V = V;
+    }
+    uint64_t *val = &gOAMemo.item[a][c][d][e][idxSlot];
+    if (!gOAMemo.set[a][c][d][e][idxSlot]) {
+        uint32_t idx = (idxSlot == UD_MEMO_IDX_GW) ? gworldIdx : idxSlot;
+        *val = ud_oa_item_at(objects, idx, gUDShift[c], gUDStride[d], gUDObjOff[e]);
+        gOAMemo.set[a][c][d][e][idxSlot] = true;
+    }
+    return *val;
+}
+
+// 返回 0=未中 1=主锚点 2=次锚点（a..e 为候选表索引，配合 memo 缓存）
 static int ud_oa_try(uint64_t V, uint32_t gworldIdx, uint64_t gworld,
-                     uint32_t innerOff, uint32_t numOff, int chunkShift,
-                     uint32_t stride, uint32_t objOff) {
+                     size_t a, size_t b, size_t c, size_t d, size_t e) {
+    const uint32_t innerOff = gUDInner[a], numOff = gUDNum[b];
     uint64_t objects = ud_kread64(V + innerOff);
     if (!ud_ptr_wide(objects)) return 0;
     int32_t numE = (int32_t)ud_kread32(V + innerOff + numOff);
@@ -620,43 +649,49 @@ static int ud_oa_try(uint64_t V, uint32_t gworldIdx, uint64_t gworld,
     }
     if (!maxOK) return 0;
 
-    // 主锚点：GWorld 反查（InternalIndex → 数组槽位 → 指针精确相等），
+    // 主锚点：GWorld 反查（memo 缓存；InternalIndex → 槽位 → 指针相等），
     // 再以数组尾部合法对象二次锚定 Num 槽位（反查本身不依赖 Num）
-    if ((uint32_t)numE > gworldIdx &&
-        ud_oa_item_at(objects, gworldIdx, chunkShift, stride, objOff) == gworld) {
+    uint64_t itemGW = ud_memo_item(V, objects, gworldIdx, a, c, d, e, UD_MEMO_IDX_GW);
+    if (itemGW == gworld) {
         for (int back = 1; back <= 4; back++) {
             if (numE <= back) break;
             if (ud_is_named_uobject(ud_oa_item_at(objects, (uint32_t)(numE - back),
-                                                  chunkShift, stride, objOff)))
+                                                  gUDShift[c], gUDStride[d], gUDObjOff[e])))
                 return 1;
         }
+        UD_LOG("主锚点命中但尾锚失败 base+0x%llx（Num@+0x%x：Num=%d）",
+               (unsigned long long)(V - gBase), innerOff + numOff, numE);
+        return 0;
     }
-    // 次锚点：Num ≥ 0x10000 且头 8 项 ≥6 个、尾部 4 项 ≥1 个是合法 UObject。
-    // 不依赖 InternalIndex / GWorld——即便游戏改了 UObject 字段偏移，
-    // 「大数组里整排都是能解出类名的对象」这一结构特征依然成立。
-    if (numE >= 0x10000) {
+    // 次锚点：仅当 gworldIdx 槽位读出的是真指针（真数组特征）才做头部
+    // 校验——垃圾结构的该槽位多为非指针，直接跳过（省 8 次内核读/组合）
+    if (numE >= 0x10000 && ud_ptr_wide(itemGW)) {
         int headOK = 0;
         for (uint32_t i = 0; i < 8; i++) {
-            if (ud_is_named_uobject(ud_oa_item_at(objects, i, chunkShift, stride, objOff)))
+            if (ud_is_named_uobject(ud_memo_item(V, objects, gworldIdx, a, c, d, e, i)))
                 headOK++;
         }
         if (headOK >= 6) {
             for (int back = 1; back <= 4; back++) {
                 if (numE <= back) break;
                 if (ud_is_named_uobject(ud_oa_item_at(objects, (uint32_t)(numE - back),
-                                                      chunkShift, stride, objOff)))
+                                                      gUDShift[c], gUDStride[d], gUDObjOff[e])))
                     return 2;
             }
         }
     }
-    // 近失诊断（限量 + 同 V 去重；Num 已限界，能到这里的都是形似候选）。
-    // 前 6 个附带 hex dump——直接把候选结构原始字节发回日志，离线定布局。
-    if (gUDNearMiss < 16 && V != gUDNearMissLastV) {
-        UD_LOG("近失候选 base+0x%llx（Obj@+0x%x Num@+0x%x：Num=%d）",
-               (unsigned long long)(V - gBase), innerOff, numOff, numE);
-        if (gUDNearMiss < 6) ud_dump_hex_ascii("近失hex", V, 0x40);
-        gUDNearMissLastV = V;
-        gUDNearMiss++;
+    // 近失诊断：高价值（Num ≥ gworldIdx/2，真 Num 必须 > gworldIdx）记
+    // 日志 + hex；其余只计数、结束汇总——不再让字节花纹垃圾烧光配额
+    if (numE >= (int32_t)(gworldIdx / 2)) {
+        if (gUDNearMiss < 8 && V != gUDNearMissLastV) {
+            UD_LOG("高价值近失 base+0x%llx（Obj@+0x%x Num@+0x%x：Num=%d）",
+                   (unsigned long long)(V - gBase), innerOff, numOff, numE);
+            ud_dump_hex_ascii("nearmiss-hex", V, 0x40);
+            gUDNearMissLastV = V;
+            gUDNearMiss++;
+        }
+    } else {
+        gUDNearMissJunk++;
     }
     return 0;
 }
@@ -667,8 +702,7 @@ static bool ud_gobjects_confirms(uint64_t V, uint32_t gworldIdx, uint64_t gworld
             for (size_t c = 0; c < UD_ARR_LEN(gUDShift); c++) {
                 for (size_t d = 0; d < UD_ARR_LEN(gUDStride); d++) {
                     for (size_t e = 0; e < UD_ARR_LEN(gUDObjOff); e++) {
-                        int hit = ud_oa_try(V, gworldIdx, gworld, gUDInner[a], gUDNum[b],
-                                            gUDShift[c], gUDStride[d], gUDObjOff[e]);
+                        int hit = ud_oa_try(V, gworldIdx, gworld, a, b, c, d, e);
                         if (hit) {
                             gOA.innerOff = gUDInner[a];
                             gOA.numOff = gUDNum[b];
@@ -836,6 +870,10 @@ static bool ud_scan_range_for_gobjects(uint64_t scanLo, uint64_t scanHi,
         uint64_t page = start & ~0x3FFFULL;
         if (page < scanLo) page = scanLo & ~0x3FFFULL;
         for (; page < end && page < scanHi; page += 0x4000ULL) {
+            // 进度心跳：每 512KB 一条，慢阶段（内核通道抖动）不再静默几分钟
+            if (((page - (scanLo & ~0x3FFFULL)) & 0x7FFFFULL) == 0 && page > (scanLo & ~0x3FFFULL)) {
+                UD_LOG("…已扫 %llu MB", (unsigned long long)((page - (scanLo & ~0x3FFFULL)) >> 20));
+            }
             // 整段 16K 批量读（坏页置零）；本地预筛后再做完整确认
             ud_kread_best_effort(page, scanBuf, 0x4000);
             for (uint64_t o = 0; o + 0x18 <= 0x4000ULL; o += 8) {
@@ -876,6 +914,176 @@ static bool ud_scan_range_for_gobjects(uint64_t scanLo, uint64_t scanHi,
     return found != 0;
 }
 
+// ============================================================
+// 值扫描定位（第四轮主攻）：堆里找 GWorld 槽位 → 反推数组 → 反查全局
+// ============================================================
+// 原理：FUObjectItem 数组第 gworldIdx 项存着 GWorld 指针。直接在大块
+// VM 区域里搜这个指针值，命中后用 idx*stride+objOff 反推数组基址并验证
+// 头部对象；再回主映像 __DATA 里搜指向该数组的指针 = GUObjectArray。
+// 这是「扫 __DATA 找结构」的反问题——不依赖 Num/Max 槽位猜测，数组在哪、
+// 什么布局一次解决。分块容器（全局只指向块指针数组）此法无效，回退
+// section 扫描。
+static bool ud_value_scan_find_array(uint32_t gworldIdx, uint64_t gworld,
+                                     uint64_t *baseOut, uint32_t *strideOut,
+                                     uint32_t *objOffOut) {
+    typedef struct { uint64_t start, end; } UDRegion;
+    UDRegion *regs = (UDRegion *)calloc(2048, sizeof(UDRegion));
+    uint8_t *buf = (uint8_t *)malloc(0x4000);
+    if (!regs || !buf) { free(regs); free(buf); return false; }
+
+    const uint64_t imgLo = gBase, imgHi = gBase + 0x12000000ULL;
+    __block int nR = 0;
+    vmmapiterateentries(gVMMap, ^(uint64_t start, uint64_t end, uint64_t entry, BOOL *stop) {
+        if (nR >= 2048) { *stop = YES; return; }
+        if (start < 0x100000000ULL || start >= 0x80000000000ULL) return;
+        if (end - start < 0x40000ULL || end - start > 0x80000000ULL) return; // 256KB..2GB
+        if (start < imgHi && end > imgLo) return; // 主映像自身不扫
+        regs[nR].start = start; regs[nR].end = end; nR++;
+    });
+    // 按距堆锚点（GWorld 对象 / GNames 容器）距离升序：对象数组是引擎
+    // 早期分配，通常与二者同处低地址堆区
+    for (int i = 1; i < nR; i++) {
+        UDRegion key = regs[i];
+        uint64_t ka = (key.start > gworld) ? (key.start - gworld) : (gworld - key.start);
+        uint64_t kb = (key.start > gGNames) ? (key.start - gGNames) : (gGNames - key.start);
+        uint64_t kd = (ka < kb) ? ka : kb;
+        int j = i - 1;
+        while (j >= 0) {
+            uint64_t a2 = (regs[j].start > gworld) ? (regs[j].start - gworld) : (gworld - regs[j].start);
+            uint64_t b2 = (regs[j].start > gGNames) ? (regs[j].start - gGNames) : (gGNames - regs[j].start);
+            uint64_t d2 = (a2 < b2) ? a2 : b2;
+            if (d2 <= kd) break;
+            regs[j + 1] = regs[j];
+            j--;
+        }
+        regs[j + 1] = key;
+    }
+    UD_LOG("值扫描：%d 个大块区域（按距堆锚点距离排序）", nR);
+
+    bool ok = false;
+    for (int r = 0; r < nR && !ok; r++) {
+        UD_LOG("值扫描 [0x%llx, 0x%llx)（%llu MB）…",
+               (unsigned long long)regs[r].start, (unsigned long long)regs[r].end,
+               (unsigned long long)((regs[r].end - regs[r].start) >> 20));
+        for (uint64_t page = regs[r].start & ~0x3FFFULL; page < regs[r].end && !ok; page += 0x4000ULL) {
+            if (((page - regs[r].start) & 0x7FFFFULL) == 0 && page > regs[r].start) {
+                UD_LOG("…值扫描进度 %llu MB", (unsigned long long)((page - regs[r].start) >> 20));
+            }
+            ud_kread_best_effort(page, buf, 0x4000);
+            for (uint64_t o = 0; o + 8 <= 0x4000ULL && !ok; o += 8) {
+                uint64_t v;
+                memcpy(&v, buf + o, 8);
+                if (v != gworld) continue;
+                uint64_t hit = page + o;
+                for (size_t d = 0; d < UD_ARR_LEN(gUDStride) && !ok; d++) {
+                    uint32_t s = gUDStride[d];
+                    for (size_t e = 0; e < UD_ARR_LEN(gUDObjOff) && !ok; e++) {
+                        uint32_t off = gUDObjOff[e];
+                        if (off >= s) continue;           // 8 字节数组只有 +0
+                        if ((hit - off) % s) continue;    // 槽位须整除对齐
+                        uint64_t base = hit - off - (uint64_t)gworldIdx * s;
+                        if (base > hit || base < 0x100000000ULL) continue; // 回绕
+                        // 验证：头 6 项 ≥4 个合法 UObject，且 idx+1 邻居合法
+                        int good = 0;
+                        for (int k = 0; k < 6; k++) {
+                            if (ud_is_named_uobject(ud_kread64(base + (uint64_t)k * s + off)))
+                                good++;
+                        }
+                        uint64_t nb = ud_kread64(base + (uint64_t)(gworldIdx + 1) * s + off);
+                        if (good >= 4 && ud_is_named_uobject(nb)) {
+                            *baseOut = base; *strideOut = s; *objOffOut = off;
+                            ok = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    free(regs); free(buf);
+    return ok;
+}
+
+// 值扫描第二步：在主映像 __DATA 各 section 搜指向对象数组的指针
+static bool ud_find_gobjects_by_value(uint32_t gworldIdx, uint64_t gworld,
+                                      uint64_t *foundOut) {
+    uint64_t base = 0; uint32_t s = 0, o = 0;
+    if (!ud_value_scan_find_array(gworldIdx, gworld, &base, &s, &o)) {
+        UD_LOG("值扫描未找到对象数组（分块容器此法无效），转 section 扫描");
+        return false;
+    }
+    UD_LOG("值扫描命中数组 base=0x%llx（stride=0x%x obj@+0x%x），反查全局指针…",
+           (unsigned long long)base, s, o);
+
+    UDSect sects[UD_MAX_SECTS];
+    int nSects = ud_collect_data_sections(sects, UD_MAX_SECTS);
+    uint8_t *buf = (uint8_t *)malloc(0x4000);
+    uint64_t *hits = (uint64_t *)calloc(8, sizeof(uint64_t));
+    if (!buf || !hits || nSects <= 0) { free(buf); free(hits); return false; }
+
+    __block int nHits = 0;
+    for (int i = 0; i < nSects && nHits < 8; i++) {
+        const uint64_t lo = sects[i].addr, hi = sects[i].addr + sects[i].size;
+        vmmapiterateentries(gVMMap, ^(uint64_t start, uint64_t end, uint64_t entry, BOOL *stop) {
+            if (nHits >= 8 || end <= lo || start >= hi) return;
+            uint64_t page = start & ~0x3FFFULL;
+            if (page < lo) page = lo & ~0x3FFFULL;
+            for (; page < end && page < hi && nHits < 8; page += 0x4000ULL) {
+                ud_kread_best_effort(page, buf, 0x4000);
+                for (uint64_t o2 = 0; o2 + 8 <= 0x4000ULL; o2 += 8) {
+                    uint64_t v;
+                    memcpy(&v, buf + o2, 8);
+                    if (v == base) {
+                        hits[nHits++] = page + o2;
+                        if (nHits >= 8) { *stop = YES; return; }
+                    }
+                }
+            }
+        });
+    }
+    free(buf);
+    if (nHits == 0) {
+        UD_LOG("全局指针反查未命中（可能为分块容器），转 section 扫描");
+        free(hits);
+        return false;
+    }
+
+    for (int h = 0; h < nHits; h++) {
+        UD_LOG("全局指针候选 0x%llx（base+0x%llx）",
+               (unsigned long long)hits[h], (unsigned long long)(hits[h] - gBase));
+        for (size_t ai = 0; ai < UD_ARR_LEN(gUDInner); ai++) {
+            uint64_t V = hits[h] - gUDInner[ai]; // 使 V + inner == 命中地址
+            if (ud_gobjects_confirms(V, gworldIdx, gworld)) {
+                *foundOut = V;
+                free(hits);
+                return true;
+            }
+            // Num 槽位未知时的兜底：V..V+0x40 找「Num>gworldIdx 且后邻 ≥ Num」
+            // 的相邻对，配合值扫描实证的 (flat, s, o) 做弱锁定
+            for (uint32_t noff = gUDInner[ai]; noff <= 0x38; noff += 4) {
+                int32_t numE = (int32_t)ud_kread32(V + noff);
+                int32_t maxE = (int32_t)ud_kread32(V + noff + 4);
+                if (numE > (int32_t)gworldIdx && numE <= 0x1000000 &&
+                    maxE >= numE && maxE <= 0x1000000) {
+                    if (ud_oa_item_at(ud_kread64(V + gUDInner[ai]), gworldIdx, 0, s, o) == gworld) {
+                        gOA.innerOff = gUDInner[ai];
+                        gOA.numOff = noff - gUDInner[ai];
+                        gOA.chunkShift = 0;
+                        gOA.itemStride = s;
+                        gOA.itemObjOff = o;
+                        gOA.weakAnchor = true;
+                        *foundOut = V;
+                        UD_LOG("值扫描弱锁定（Num 启发式 @+0x%x：Num=%d）", noff, numE);
+                        free(hits);
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    free(hits);
+    return false;
+}
+
 static bool ud_find_gobjects(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     if (UE.offGObjects == 0) {
@@ -901,51 +1109,57 @@ static bool ud_find_gobjects(void) {
         UD_LOG("记忆偏移 0x%x 校验失败，重新扫描", UE.offGObjects);
     }
 
-    // ---- 扫描定位 ----
-    // 第 0 优先：GWorld 全局附近 ±1MB——GUObjectArray/GEngine 通常与其
-    // 链接相邻（第三轮真机：GWorld 在 __common，旧排序里该段第二个才扫、
-    // 扫到一半日志就截断了；先扫它周边，最快命中）。
+    // ---- 定位 ----
+    // 第 0 优先：值扫描——堆里直接搜 GWorld 指针所在的数组槽位，反推数组
+    // 基址后回 __DATA 反查全局指针。不依赖 Num/Max 槽位猜测（第四轮主攻）。
     uint64_t found = 0;
-    const uint64_t gwAbs = gBase + UE.offGWorld;
-    UD_LOG("优先扫描 GWorld 全局附近 [0x%llx, 0x%llx)…",
-           (unsigned long long)(gwAbs - 0x100000), (unsigned long long)(gwAbs + 0x100000));
-    ud_scan_range_for_gobjects(gwAbs - 0x100000, gwAbs + 0x100000,
-                               gworldIdx, gGWorld, &found);
+    if (!ud_find_gobjects_by_value(gworldIdx, gGWorld, &found)) {
+        // 第 1 优先：GWorld 全局附近 ±1MB（GUObjectArray/GEngine 通常与其
+        // 链接相邻；配合 memo 化确认，2MB 窗口秒级）
+        const uint64_t gwAbs = gBase + UE.offGWorld;
+        UD_LOG("优先扫描 GWorld 全局附近 [0x%llx, 0x%llx)…",
+               (unsigned long long)(gwAbs - 0x100000), (unsigned long long)(gwAbs + 0x100000));
+        ud_scan_range_for_gobjects(gwAbs - 0x100000, gwAbs + 0x100000,
+                                   gworldIdx, gGWorld, &found);
 
-    // 第 1 优先：远程解析主映像 Mach-O，逐 section 扫描全部 __DATA* 段（含
-    // __bss/__common——GUObjectArray 全局可能在任一数据 section），
-    // 按「距 GNames / GWorld 全局的最小距离」从近到远扫；解析失败回退窗口。
-    UDSect sects[UD_MAX_SECTS];
-    int nSects = ud_collect_data_sections(sects, UD_MAX_SECTS);
-    if (nSects > 0) {
-        UD_LOG("主映像解析到 %d 个 __DATA* section（按距 GNames/GWorld 距离近 → 远）", nSects);
-        for (int i = 0; i < nSects && !found; i++) {
-            UD_LOG("扫描 %s [0x%llx, 0x%llx)（%llu MB）…",
-                   sects[i].name,
-                   (unsigned long long)sects[i].addr,
-                   (unsigned long long)(sects[i].addr + sects[i].size),
-                   (unsigned long long)(sects[i].size >> 20));
-            ud_scan_range_for_gobjects(sects[i].addr, sects[i].addr + sects[i].size,
+        // 第 2 优先：远程解析主映像 Mach-O，逐 section 扫描全部 __DATA* 段
+        // （含 __bss/__common），按「距 GNames / GWorld 全局的最小距离」从近
+        // 到远扫；解析失败回退窗口。
+        UDSect sects[UD_MAX_SECTS];
+        int nSects = ud_collect_data_sections(sects, UD_MAX_SECTS);
+        if (nSects > 0) {
+            UD_LOG("主映像解析到 %d 个 __DATA* section（按距 GNames/GWorld 距离近 → 远）", nSects);
+            for (int i = 0; i < nSects && !found; i++) {
+                UD_LOG("扫描 %s [0x%llx, 0x%llx)（%llu MB）…",
+                       sects[i].name,
+                       (unsigned long long)sects[i].addr,
+                       (unsigned long long)(sects[i].addr + sects[i].size),
+                       (unsigned long long)(sects[i].size >> 20));
+                ud_scan_range_for_gobjects(sects[i].addr, sects[i].addr + sects[i].size,
+                                           gworldIdx, gGWorld, &found);
+            }
+        } else if (!found) {
+            UD_LOG("Mach-O section 解析失败，回退 GNames 附近窗口扫描");
+            const uint64_t scanLoOff = (UE.offGNames > 0x4000000) ? (UE.offGNames - 0x4000000) : 0;
+            const uint64_t scanHiOff = (uint64_t)UE.offGNames + 0x2000000;
+            UD_LOG("扫描 [0x%llx, 0x%llx)（约 %llu MB）…",
+                   (unsigned long long)(gBase + scanLoOff), (unsigned long long)(gBase + scanHiOff),
+                   (unsigned long long)((scanHiOff - scanLoOff) >> 20));
+            ud_scan_range_for_gobjects(gBase + scanLoOff, gBase + scanHiOff,
                                        gworldIdx, gGWorld, &found);
         }
-    } else if (!found) {
-        UD_LOG("Mach-O section 解析失败，回退 GNames 附近窗口扫描");
-        const uint64_t scanLoOff = (UE.offGNames > 0x4000000) ? (UE.offGNames - 0x4000000) : 0;
-        const uint64_t scanHiOff = (uint64_t)UE.offGNames + 0x2000000;
-        UD_LOG("扫描 [0x%llx, 0x%llx)（约 %llu MB）…",
-               (unsigned long long)(gBase + scanLoOff), (unsigned long long)(gBase + scanHiOff),
-               (unsigned long long)((scanHiOff - scanLoOff) >> 20));
-        ud_scan_range_for_gobjects(gBase + scanLoOff, gBase + scanHiOff,
-                                   gworldIdx, gGWorld, &found);
     }
     ud_page_cache_flush(); // 扫描产生大量一次性映射，回收
     if (gUDMapFail > 0) {
         UD_LOG("页映射失败 %ld 次（内核通道不稳时读到全零，可能漏掉真身——建议重跑）",
                gUDMapFail);
     }
+    if (gUDNearMissJunk > 0) {
+        UD_LOG("另有 %ld 个低价值近失（Num 形似字节花纹，已忽略）", gUDNearMissJunk);
+    }
 
     if (!found) {
-        ud_fail(@"GUObjectArray 自动扫描未命中（已扫全部 __DATA section）——把控制台日志发回分析，或手动填 UE.offGObjects");
+        ud_fail(@"GUObjectArray 自动扫描未命中（值扫描 + 全部 __DATA section 均未命中）——把控制台日志发回分析，或手动填 UE.offGObjects");
         return false;
     }
     gGObjects = found;
@@ -1385,7 +1599,8 @@ void UESDumperStart(void) {
     gNameIndexMode = 1;
     gOA.innerOff = 0x10; gOA.numOff = 0x14; gOA.chunkShift = 16;
     gOA.itemStride = 0x18; gOA.itemObjOff = 0; gOA.weakAnchor = false;
-    gUDNearMiss = 0; gUDNearMissLastV = 0; gUDMapFail = 0;
+    gUDNearMiss = 0; gUDNearMissLastV = 0; gUDMapFail = 0; gUDNearMissJunk = 0;
+    gOAMemo.V = 0;
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
