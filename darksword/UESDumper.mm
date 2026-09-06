@@ -4,14 +4,22 @@
 //
 //  UE4 SDK Dumper（内核远程读版）
 //
-//  移植自 MJx0/iOS_UEDumper（MIT）的思路：通过 GNames(FNamePool) +
-//  GUObjectArray(TUObjectArray) 遍历 UE4 反射系统，生成 SDK。
-//  区别：iOS_UEDumper 是注入游戏的 tweak（本地读内存）；本模块用
-//  DarkSword 内核的 vmmapremotepage 远程页映射读取游戏内存，
-//  只需游戏正在运行，不动游戏进程，也不依赖 RemoteCall。
+//  移植自 MJx0/iOS_UEDumper（MIT）的思路：通过 GNames + GUObjectArray
+//  遍历 UE4 反射系统，生成 SDK。区别：iOS_UEDumper 是注入游戏的 tweak
+//  （本地读内存）；本模块用 DarkSword 内核的 vmmapremotepage 远程页映射
+//  读取游戏内存，只需游戏正在运行，不动游戏进程，也不依赖 RemoteCall。
 //
-//  所有 UE 结构偏移集中在下方「UE 偏移配置」区——随游戏版本更新
-//  改那里即可（对照 Objects.txt / IDA）。
+//  布局依据（2026-09-06 真机诊断日志 + iOS_UEDumper 参考实现）：
+//  - UObject 为 stock UE4.23+ 布局（GWorld 转储验证：Class@0x10 /
+//    Name@0x18 / Outer@0x20 / InternalIndex@0x0C）
+//  - GNames 为定制 TNameEntryArray 风格：
+//      [base+offGNames] → 块指针数组（+0x00 起，无头部）
+//      每块             → 条目指针数组（位置即索引）
+//      条目             → {+0x00 哈希链; +0x08 u32 id; +0x0C u16; +0x0E NUL 结尾名字}
+//    条目 id = (块<<15)|(位置<<1)，与全部观测样本吻合；FName index 的
+//    编码用三候选 + 「GWorld 类名必须是 World」锚点在运行时确定。
+//  - GUObjectArray 的 ObjObjects 内偏移 / Num 偏移 / 每 chunk 元素数
+//    用组合候选自适应（GWorld 反查强校验）。
 //
 
 #import "UESDumper.h"
@@ -79,58 +87,53 @@ static os_log_t ud_log_handle(void) {
 // ============================================================
 // UE 偏移配置（随游戏版本更新改这里）
 // ============================================================
-// 主映像全局默认值取自 PeaceESP.mm 已验证的 O_GWORLD / O_GNAME；
-// 结构偏移取 stock UE4.25 布局。ShadowTrackerExtra 是深度定制引擎，
-// 结构偏移可能不符——不符时 Objects.txt / Offsets.txt 仍然可靠，
-// SDK.hpp 的字段以这里的配置修正为准。
 static struct {
     // ---- 主映像内全局（base + offset 处存放指针）----
-    uint32_t offGWorld;      // GWorld 全局
-    uint32_t offGNames;      // GNames / FNamePool 全局
+    uint32_t offGWorld;      // GWorld 全局（已验证：0x1148B608）
+    uint32_t offGNames;      // GNames 全局（已验证：0x11FBA198）
     uint32_t offGObjects;    // GUObjectArray 全局；0 = 自动扫描（找到后自动记忆）
 
-    // ---- UObject ----
-    uint32_t uobjName;       // FName（comparison index，int32）
-    uint32_t uobjClass;      // ClassPrivate 指针
-    uint32_t uobjOuter;      // OuterPrivate 指针
-    uint32_t uobjIndex;      // InternalIndex（int32）
+    // ---- UObject（stock UE4.23+；GWorld 转储已验证）----
+    uint32_t uobjName;       // FName：index@+0x18（u32），number@+0x1C（u32）
+    uint32_t uobjClass;      // ClassPrivate @+0x10
+    uint32_t uobjOuter;      // OuterPrivate @+0x20
+    uint32_t uobjIndex;      // InternalIndex @+0x0C
 
-    // ---- UStruct / UField（UE4.23+）----
-    uint32_t ufieldNext;     // UField::Next
-    uint32_t ustructSuper;   // UStruct::SuperStruct
-    uint32_t ustructChildren;// UStruct::Children
-    uint32_t ustructChildProps; // UStruct::ChildProperties（FField 链）
-    uint32_t ustructSize;    // UStruct::PropertiesSize
+    // ---- UField / UStruct（iOS_UEDumper UE4.25 公式）----
+    uint32_t ufieldNext;     // UField::Next @+0x28
+    uint32_t ustructSuper;   // UStruct::SuperStruct @+0x40
+    uint32_t ustructChildren;// UStruct::Children @+0x48
+    uint32_t ustructChildProps; // UStruct::ChildProperties（FField 链）@+0x50
+    uint32_t ustructSize;    // UStruct::PropertiesSize（u32）@+0x58
 
-    // ---- FProperty（UE4.23+ FField）----
-    uint32_t ffieldClass;    // FField::ClassPrivate（FFieldClass*）
-    uint32_t ffieldName;    // FField::NamePrivate（FName index）
-    uint32_t ffieldNext;    // FField::Next
-    uint32_t fpropArrayDim;
-    uint32_t fpropOffset;    // FProperty::Offset_Internal
+    // ---- FField / FProperty（iOS_UEDumper UE4.25 公式）----
+    uint32_t ffieldClass;    // FField::ClassPrivate @+0x08
+    uint32_t ffieldName;    // FField::NamePrivate：index@+0x28，number@+0x2C
+    uint32_t ffieldNext;    // FField::Next @+0x20
+    uint32_t fpropArrayDim;  // FProperty::ArrayDim（u32）@+0x34
+    uint32_t fpropOffset;    // FProperty::Offset_Internal（u32）@+0x4C
 
-    // ---- UEnum / UFunction ----
-    uint32_t uenumNames;     // UEnum::Names（TArray）
-    uint32_t ufuncExec;      // UFunction::Func（native 函数指针）
+    // ---- UEnum / UFunction（iOS_UEDumper UE4.25 公式）----
+    uint32_t uenumNames;     // UEnum::Names（TArray：data@+0x40，num@+0x48）
+    uint32_t ufuncExec;      // UFunction::Func @+0xD8
 } UE = {
     0x1148B608,  // offGWorld
     0x11FBA198,  // offGNames
     0,           // offGObjects：自动扫描
 
-    0x08, 0x10, 0x18, 0x04, // UObject（NamePrivate@0x08 Class@0x10 Outer@0x18 InternalIndex@0x04）
+    0x18, 0x10, 0x20, 0x0C,        // UObject
 
-    0x20, 0x28, 0x30, 0x38, 0x40, // UStruct
+    0x28, 0x40, 0x48, 0x50, 0x58,  // UField/UStruct
 
-    0x00, 0x08, 0x18, 0x20, 0x4C, // FField/FProperty
+    0x08, 0x28, 0x20, 0x34, 0x4C,  // FField/FProperty
 
-    0x30, 0xB8, // UEnum / UFunction
+    0x40, 0xD8,                     // UEnum/UFunction
 };
 
 static NSString * const kUDGObjectsOffKey = @"rein.uesdumper.gobjectsOff";
 
 // ============================================================
-// 远程读层（vm_object 页映射 + 开放寻址页缓存；独立于 PeaceESP，
-// 两者各自维护缓存互不干扰——同页会被各映射一份，只影响少量内存）
+// 远程读层（vm_object 页映射 + 开放寻址页缓存；独立于 PeaceESP）
 // ============================================================
 
 static uint64_t gVMMap = 0;
@@ -212,53 +215,47 @@ static bool ud_kreadbuf(uint64_t va, void *out, size_t sz) {
 
 static uint64_t ud_kread64(uint64_t va) { uint64_t v = 0; ud_kreadbuf(va, &v, 8); return v; }
 static uint32_t ud_kread32(uint64_t va) { uint32_t v = 0; ud_kreadbuf(va, &v, 4); return v; }
-static uint16_t ud_kread16(uint64_t va) { uint16_t v = 0; ud_kreadbuf(va, &v, 2); return v; }
 
 static bool ud_userland(uint64_t p) { return p >= 0x100000000ULL && p < 0x800000000ULL; }
 
 // ============================================================
-// FName 名字池（UE4.23+ FNamePool）
+// GNames（定制 TNameEntryArray 风格；真机诊断已确认布局）
 // ============================================================
-// FNamePool { Lock(8) CurrentBlock(4) CurrentByteCursor(4) Blocks[8192] }
-// Block 大小 0x10000；Entry { uint16 头(低1位wide, 高15位长度) char 数据[] }
-static uint64_t gGNames = 0;
-static uint32_t gBlocksOff = 0x10; // FNamePool 内 Blocks 数组偏移（诊断可自适应修正）
 
-// 按指定 Blocks 内偏移尝试解析名字（诊断/自适应用）
-static bool ud_name_try_inner(uint32_t inner, uint32_t idx, char *out, size_t cap) {
-    if (!gGNames || !out || cap == 0) return false;
-    uint32_t block = idx >> 16;
-    uint32_t off = idx & 0xFFFF;
-    if (block >= 8192) return false;
-    uint64_t blockPtr = ud_kread64(gGNames + inner + (uint64_t)block * 8);
-    if (!ud_userland(blockPtr)) return false;
-    uint16_t header = ud_kread16(blockPtr + off);
-    size_t len = header >> 1;
-    bool wide = header & 1;
-    if (len == 0 || len >= 1024 || len + 1 > cap) return false;
-    if (wide) {
-        // 宽字符名（游戏里几乎都是窄的）：降级取低字节
-        uint16_t w[512];
-        if (len > 511) return false;
-        if (!ud_kreadbuf(blockPtr + off + 2, w, len * 2)) return false;
-        for (size_t i = 0; i < len; i++) {
-            out[i] = (w[i] < 128 && w[i] >= 32) ? (char)w[i] : '?';
-        }
-        out[len] = 0;
-    } else {
-        if (!ud_kreadbuf(blockPtr + off + 2, out, len)) return false;
-        out[len] = 0;
-    }
-    // 可打印性校验（防偏移错位读到垃圾）
+static uint64_t gGNames = 0;
+static int gNameIndexMode = 1; // 0=(块<<14|位置) 1=(块<<15)|(位置<<1) 2=(块<<16|位置)
+
+// 条目名字：NUL 结尾字符串 @+0x0E
+static bool ud_entry_name(uint64_t entry, char *out, size_t cap) {
+    if (!ud_userland(entry) || cap == 0) return false;
+    uint8_t buf[256];
+    if (!ud_kreadbuf(entry + 0x0E, buf, sizeof(buf))) return false;
+    size_t len = 0;
+    while (len < sizeof(buf) && buf[len] != 0) len++;
+    if (len == 0 || len >= sizeof(buf)) return false; // 无 NUL 或名字超长
+    if (len + 1 > cap) return false;
+    memcpy(out, buf, len + 1);
     for (size_t i = 0; i < len; i++) {
         unsigned char c = (unsigned char)out[i];
-        if (c < 0x20 || c > 0x7E) return false;
+        if (c < 0x20 || c > 0x7E) return false; // 防错位读到垃圾
     }
     return true;
 }
 
-static bool ud_name_from_index(uint32_t idx, char *out, size_t cap) {
-    return ud_name_try_inner(gBlocksOff, idx, out, cap);
+// 按指定 index 编码解码名字
+static bool ud_name_decode(int mode, uint32_t F, char *out, size_t cap) {
+    uint32_t chunk, pos;
+    switch (mode) {
+        case 0:  chunk = F >> 14; pos = F & 0x3FFF;       break;
+        case 1:  chunk = F >> 15; pos = (F & 0x7FFF) >> 1; break;
+        default: chunk = F >> 16; pos = F & 0xFFFF;      break;
+    }
+    if (chunk >= 8192) return false;
+    uint64_t chunkPtr = ud_kread64(gGNames + (uint64_t)chunk * 8);
+    if (!ud_userland(chunkPtr)) return false;
+    uint64_t entry = ud_kread64(chunkPtr + (uint64_t)pos * 8);
+    if (!ud_userland(entry)) return false;
+    return ud_entry_name(entry, out, cap);
 }
 
 // 名字缓存：槽位带 idx 键（命中才用），保证不因哈希冲突串名
@@ -276,8 +273,8 @@ static const char *ud_name_cached(uint32_t idx) {
     if (gNameCache[slot].str && gNameCache[slot].idx == idx) {
         return gNameCache[slot].str;
     }
-    char buf[1024];
-    if (!ud_name_from_index(idx, buf, sizeof(buf))) return NULL; // 不缓存失败，直接返回
+    char buf[320];
+    if (!ud_name_decode(gNameIndexMode, idx, buf, sizeof(buf))) return NULL;
     if (gNameCache[slot].str) free(gNameCache[slot].str);
     gNameCache[slot].idx = idx;
     gNameCache[slot].str = strdup(buf);
@@ -293,16 +290,30 @@ static void ud_name_cache_free(void) {
     gNameCache = NULL;
 }
 
-// 对象名（UObject）
+// 对象名（含 number 后缀：number>0 → "_{number-1}"）。
+// 返回值指向循环缓冲，调用方需立即使用（拼路径时当场拷贝）。
+static char gNameBuf[8][352];
+static int gNameBufIdx = 0;
+
 static const char *ud_obj_name(uint64_t obj) {
-    return ud_name_cached(ud_kread32(obj + UE.uobjName));
+    uint32_t idx = ud_kread32(obj + UE.uobjName);
+    uint32_t num = ud_kread32(obj + UE.uobjName + 4);
+    const char *base = ud_name_cached(idx);
+    if (!base) return NULL;
+    char *buf = gNameBuf[gNameBufIdx = (gNameBufIdx + 1) & 7];
+    if (num > 0 && num < 1000000) {
+        snprintf(buf, 352, "%s_%u", base, num - 1);
+    } else {
+        snprintf(buf, 352, "%s", base);
+    }
+    return buf;
 }
 
 // 完整路径（沿 Outer 链向上拼；深度限 10 防环）
 static void ud_full_path(uint64_t obj, char *out, size_t cap) {
     out[0] = 0;
     if (!ud_userland(obj)) return;
-    char parts[12][256];
+    char parts[12][352];
     int n = 0;
     uint64_t cur = obj;
     while (n < 10) {
@@ -325,6 +336,7 @@ static void ud_full_path(uint64_t obj, char *out, size_t cap) {
 // ============================================================
 // 状态
 // ============================================================
+
 static volatile bool gUDRunning = false;
 static NSString *gUDError = @"";
 static NSString *gUDOutput = @"";
@@ -343,8 +355,7 @@ static void ud_fail(NSString *msg) {
 // ============================================================
 static uint64_t gBase = 0, gGWorld = 0, gGObjects = 0;
 
-// 指定地址起 n 字节的 hex+ASCII 双视图（诊断用；ASCII 是关键——
-// 名字条目在 ASCII 视图里直接可读，一眼区分「名字数据 / 指针 / 加密乱码」）
+// 指定地址起 n 字节的 hex+ASCII 双视图（诊断用）
 static void ud_dump_hex_ascii(const char *tag, uint64_t addr, int bytes) {
     uint8_t b[64];
     int n = (bytes < 64) ? bytes : 64;
@@ -362,64 +373,38 @@ static void ud_dump_hex_ascii(const char *tag, uint64_t addr, int bytes) {
     UD_LOG("%s @0x%llx\n  hex: %@\n  asc: %@", tag, (unsigned long long)addr, hex, asc);
 }
 
-/// GNames 自检失败时的深度诊断（ShadowTracker 的布局与 stock UE 差异较大：
-/// pool 头部直接就是指针数组，且目标内容仍是指针——至少两级间接）。
-/// 采集足以离线定位布局的数据：
-///   ① GWorld 头 0x40 字节 → 确定 vtable / FName / Class 的真实位置
-///   ② pool 头 0x40 字节
-///   ③ 两级指针追踪：pool[i] → 目标 → 再解引用 → 内容（ASCII 可读 = 名字数据层）
-///   ④ 按当前 NameIdx 候选直接试探目标条目（blocks@+0x00 假设）
-///   ⑤ 保留 stock 布局自适应尝试（对其他游戏仍有效）
-static bool ud_gnames_diagnose(void) {
+/// GNames 失败时的深度诊断（布局证据采集）
+static void ud_gnames_dump_diagnose(void) {
     UD_LOG_ERROR("── GNames 深度诊断开始 ──");
-
-    // ① GWorld 头部：找 vtable / FName / Class 真实位置
-    ud_dump_hex_ascii("①GWorld+0x00", gGWorld, 64);
-
-    // ② pool 头部
-    ud_dump_hex_ascii("②pool+0x00", gGNames, 64);
-
-    // ③ 两级指针追踪（上次漏了 pool+0x00 的目标——那可能才是第一个名字块）
-    for (int i = 0; i < 4; i++) {
-        uint64_t p1 = ud_kread64(gGNames + (uint64_t)i * 8);
-        if (!ud_userland(p1)) continue;
-        char tag1[64];
-        snprintf(tag1, sizeof(tag1), "③pool[%d]目标", i);
-        ud_dump_hex_ascii(tag1, p1, 32);
-        for (int j = 0; j < 2; j++) {
-            uint64_t p2 = ud_kread64(p1 + (uint64_t)j * 8);
-            if (!ud_userland(p2)) continue;
-            char tag2[80];
-            snprintf(tag2, sizeof(tag2), "③pool[%d][%d]二层目标", i, j);
-            ud_dump_hex_ascii(tag2, p2, 32);
+    UD_LOG("GNames=0x%llx GWorld=0x%llx Class=0x%llx",
+           (unsigned long long)gGNames, (unsigned long long)gGWorld,
+           (unsigned long long)ud_kread64(gGWorld + UE.uobjClass));
+    UD_LOG("GWorld: NameIdx=0x%x NameNum=0x%x InternalIndex=0x%x",
+           ud_kread32(gGWorld + UE.uobjName), ud_kread32(gGWorld + UE.uobjName + 4),
+           ud_kread32(gGWorld + UE.uobjIndex));
+    ud_dump_hex_ascii("GWorld头", gGWorld, 64);
+    ud_dump_hex_ascii("pool头", gGNames, 64);
+    for (int i = 0; i < 3; i++) {
+        uint64_t chunk = ud_kread64(gGNames + (uint64_t)i * 8);
+        if (!ud_userland(chunk)) continue;
+        ud_dump_hex_ascii("块头", chunk, 32);
+        uint64_t entry = ud_kread64(chunk);
+        if (ud_userland(entry)) ud_dump_hex_ascii("条目0", entry, 48);
+    }
+    // 三种 index 编码对 GWorld 类名的解码结果（正常其一应为 "World"）
+    uint64_t cls = ud_kread64(gGWorld + UE.uobjClass);
+    if (ud_userland(cls)) {
+        uint32_t clsF = ud_kread32(cls + UE.uobjName);
+        for (int mode = 0; mode < 3; mode++) {
+            char n[256];
+            if (ud_name_decode(mode, clsF, n, sizeof(n))) {
+                UD_LOG("mode%d 解码 GWorld 类名 = %s", mode, n);
+            } else {
+                UD_LOG("mode%d 解码失败", mode);
+            }
         }
     }
-
-    // ④ NameIdx 候选（若 name@+0x08 成立）按 blocks@+0x00 直取试探
-    uint32_t widx = ud_kread32(gGWorld + UE.uobjName);
-    UD_LOG("④NameIdx候选=0x%x（block 0x%x + off 0x%x）", widx, widx >> 16, widx & 0xFFFF);
-    uint64_t blk = ud_kread64(gGNames + (uint64_t)(widx >> 16) * 8);
-    if (ud_userland(blk)) {
-        ud_dump_hex_ascii("④目标block头", blk, 32);
-        ud_dump_hex_ascii("④目标entry", blk + (widx & 0xFFFF), 32);
-    }
-
-    // ⑤ stock 布局自适应（对未定制引擎仍有效）
-    static const uint32_t kInners[] = {0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40, 0x50, 0x60, 0x80, 0xC0};
-    for (size_t k = 0; k < sizeof(kInners) / sizeof(kInners[0]); k++) {
-        uint32_t inner = kInners[k];
-        char n1[256], n2[256];
-        if (ud_name_try_inner(inner, widx, n1, sizeof(n1)) &&
-            ud_name_try_inner(inner, 0, n2, sizeof(n2))) {
-            gBlocksOff = inner;
-            UD_LOG("→ 自适应命中：GWorld 名=%s，entry0=%s（Blocks@+0x%02x）", n1, n2, inner);
-            UD_LOG_ERROR("── GNames 诊断结束：布局已自适应 ──");
-            return true;
-        }
-    }
-
-    UD_LOG_ERROR("── GNames 深度诊断结束：把上面整段日志（含 hex/asc）发回分析 ──");
-    return false;
+    UD_LOG_ERROR("── GNames 深度诊断结束 ──");
 }
 
 static bool ud_attach_game(void) {
@@ -471,51 +456,106 @@ static bool ud_attach_game(void) {
     gGWorld = ud_kread64(gBase + UE.offGWorld);
     if (!ud_userland(gGWorld)) { ud_fail(@"GWorld 无效（游戏可能还在加载，或 offGWorld 过期）"); return false; }
 
+    // ---- GNames 校验（锚点1：块0/条目0 的名字必须是 "None"）----
     gGNames = ud_kread64(gBase + UE.offGNames);
     if (!ud_userland(gGNames)) { ud_fail(@"GNames 无效（offGNames 可能过期）"); return false; }
-    // 名字池自检：解析 GWorld 对象自身的名字
-    char nameBuf[256];
-    uint32_t wnameIdx = ud_kread32(gGWorld + UE.uobjName);
-    if (!ud_name_from_index(wnameIdx, nameBuf, sizeof(nameBuf))) {
-        // stock 布局解析失败：先诊断（可能自动适配成功），不行才报错
-        if (!ud_gnames_diagnose()) {
-            ud_fail(@"GNames 名字解析失败（详见上方诊断日志：offGNames 有误 / 布局不符 / 名字加密）");
-            return false;
-        }
-    } else {
-        UD_LOG("GNames OK（GWorld 对象名 = %s）", nameBuf);
+    char noneBuf[64];
+    uint64_t chunk0 = ud_kread64(gGNames);
+    uint64_t entry0 = ud_userland(chunk0) ? ud_kread64(chunk0) : 0;
+    if (!ud_entry_name(entry0, noneBuf, sizeof(noneBuf)) || strcmp(noneBuf, "None") != 0) {
+        ud_gnames_dump_diagnose();
+        ud_fail(@"GNames 布局校验失败（块0/条目0 应为 None，详见诊断日志）");
+        return false;
     }
+    UD_LOG("GNames OK（条目0 = %s，id=0x%x）", noneBuf, ud_kread32(entry0 + 0x08));
+
+    // ---- index 编码确定（锚点2：GWorld 的类名必须是 "World"）----
+    uint64_t cls = ud_kread64(gGWorld + UE.uobjClass);
+    if (!ud_userland(cls)) { ud_fail(@"GWorld ClassPrivate 无效"); return false; }
+    uint32_t clsF = ud_kread32(cls + UE.uobjName);
+    gNameIndexMode = -1;
+    for (int mode = 0; mode < 3; mode++) {
+        char n[256];
+        if (ud_name_decode(mode, clsF, n, sizeof(n)) && strcmp(n, "World") == 0) {
+            gNameIndexMode = mode;
+            break;
+        }
+    }
+    if (gNameIndexMode < 0) {
+        // 没有候选命中 "World"——打出三者结果供离线分析
+        for (int mode = 0; mode < 3; mode++) {
+            char n[256];
+            if (ud_name_decode(mode, clsF, n, sizeof(n))) {
+                UD_LOG("mode%d 解码 GWorld 类名 = %s", mode, n);
+            }
+        }
+        ud_fail(@"GNames index 编码确定失败（无候选解出类名 World）");
+        return false;
+    }
+    UD_LOG("index 编码 = mode%d（GWorld 类名 = World ✓）", gNameIndexMode);
     return true;
 }
 
 // ============================================================
-// GUObjectArray 定位（自动扫描，找到后记忆到 NSUserDefaults）
+// GUObjectArray 定位（组合候选自适应 + 自动扫描，找到后记忆）
 // ============================================================
-// TUObjectArray { FUObjectItem** Objects; int32 Max; int32 Num; int32 MaxChunks; int32 NumChunks; }
-// FUObjectItem = 0x18；每 chunk 64 项。
-// FUObjectArray 全局里 ObjObjects 成员不一定在 0 偏移——对每个候选值
-// 依次尝试 {0, 0x10, ..., 0x60} 作为 ObjObjects 在候选内的偏移。
+// 布局候选（iOS_UEDumper 公式 + 真机适配）：
+//   ObjObjects 内偏移 ∈ {0x00, 0x10}；Num 偏移 ∈ {0x0C, 0x14}；
+//   每 chunk 元素数 ∈ {64, 8192, 65536}；FUObjectItem = 0x18。
 // 确认法（强校验）：用已知 GWorld 的 InternalIndex 反查数组，命中即真。
-static bool ud_gobjects_confirms(uint64_t V, uint32_t gworldIdx, uint64_t gworld,
-                                 uint32_t *outInnerOff) {
-    static const uint32_t kInnerOffs[] = {0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x58, 0x60};
-    for (size_t k = 0; k < sizeof(kInnerOffs) / sizeof(kInnerOffs[0]); k++) {
-        uint32_t d = kInnerOffs[k];
-        uint64_t chunks = ud_kread64(V + d);
-        if (!ud_userland(chunks)) continue;
-        int32_t maxE = (int32_t)ud_kread32(V + d + 0x8);
-        int32_t numE = (int32_t)ud_kread32(V + d + 0xC);
-        if (maxE <= 0 || numE < 0x100 || numE > maxE || maxE > 0x8000000) continue;
-        if ((uint32_t)numE <= gworldIdx) continue;
-        uint64_t chunk = ud_kread64(chunks + (uint64_t)(gworldIdx >> 6) * 8);
-        if (!ud_userland(chunk)) continue;
-        uint64_t item = ud_kread64(chunk + (uint64_t)(gworldIdx & 63) * 0x18);
-        if (item == gworld) {
-            if (outInnerOff) *outInnerOff = d;
-            return true;
+static struct {
+    uint32_t innerOff;  // ObjObjects 在候选结构内的偏移
+    uint32_t numOff;    // Num 在 TUObjectArray 内的偏移
+    int chunkShift;     // 每 chunk 元素数 = 1 << chunkShift
+} gOA = { 0x10, 0x14, 16 };
+
+static bool ud_oa_try(uint64_t V, uint32_t gworldIdx, uint64_t gworld,
+                       uint32_t innerOff, uint32_t numOff, int chunkShift) {
+    uint64_t chunks = ud_kread64(V + innerOff);
+    if (!ud_userland(chunks)) return false;
+    int32_t numE = (int32_t)ud_kread32(V + innerOff + numOff);
+    int32_t maxE = (int32_t)ud_kread32(V + innerOff + numOff - 4); // Max 紧邻 Num 之前
+    if (numE <= 0 || numE > 0x10000000) return false;
+    if (maxE < numE || maxE > 0x10000000) return false;
+    if ((uint32_t)numE <= gworldIdx) return false;
+    uint32_t mask = (1u << chunkShift) - 1;
+    uint64_t chunk = ud_kread64(chunks + (uint64_t)(gworldIdx >> chunkShift) * 8);
+    if (!ud_userland(chunk)) return false;
+    uint64_t item = ud_kread64(chunk + (uint64_t)(gworldIdx & mask) * 0x18);
+    return item == gworld;
+}
+
+static bool ud_gobjects_confirms(uint64_t V, uint32_t gworldIdx, uint64_t gworld) {
+    static const uint32_t kInner[] = { 0x10, 0x00 };
+    static const uint32_t kNum[] = { 0x14, 0x0C };
+    static const int kShift[] = { 16, 13, 6 };
+    for (size_t a = 0; a < sizeof(kInner) / sizeof(kInner[0]); a++) {
+        for (size_t b = 0; b < sizeof(kNum) / sizeof(kNum[0]); b++) {
+            for (size_t c = 0; c < sizeof(kShift) / sizeof(kShift[0]); c++) {
+                if (ud_oa_try(V, gworldIdx, gworld, kInner[a], kNum[b], kShift[c])) {
+                    gOA.innerOff = kInner[a];
+                    gOA.numOff = kNum[b];
+                    gOA.chunkShift = kShift[c];
+                    return true;
+                }
+            }
         }
     }
     return false;
+}
+
+// 按已锁定的布局取第 idx 个 UObject
+static uint64_t ud_uobject_at(uint32_t idx) {
+    uint64_t chunks = ud_kread64(gGObjects + gOA.innerOff);
+    if (!ud_userland(chunks)) return 0;
+    uint32_t mask = (1u << gOA.chunkShift) - 1;
+    uint64_t chunk = ud_kread64(chunks + (uint64_t)(idx >> gOA.chunkShift) * 8);
+    if (!ud_userland(chunk)) return 0;
+    return ud_kread64(chunk + (uint64_t)(idx & mask) * 0x18);
+}
+
+static int32_t ud_uobject_count(void) {
+    return (int32_t)ud_kread32(gGObjects + gOA.innerOff + gOA.numOff);
 }
 
 static bool ud_find_gobjects(void) {
@@ -527,16 +567,16 @@ static bool ud_find_gobjects(void) {
 
     uint32_t gworldIdx = ud_kread32(gGWorld + UE.uobjIndex);
     if (gworldIdx == 0 || gworldIdx > 0x2000000) {
-        ud_fail([NSString stringWithFormat:@"GWorld InternalIndex 异常（0x%x），UObject 布局可能不符", gworldIdx]);
+        ud_fail([NSString stringWithFormat:@"GWorld InternalIndex 异常（0x%x）", gworldIdx]);
         return false;
     }
     UD_LOG("GWorld InternalIndex=%u，开始定位 GUObjectArray", gworldIdx);
 
     if (UE.offGObjects != 0) {
-        uint32_t inner = 0;
-        if (ud_gobjects_confirms(gBase + UE.offGObjects, gworldIdx, gGWorld, &inner)) {
+        if (ud_gobjects_confirms(gBase + UE.offGObjects, gworldIdx, gGWorld)) {
             gGObjects = gBase + UE.offGObjects;
-            UD_LOG("GUObjectArray 命中记忆偏移 0x%x（ObjObjects 在 +0x%x）", UE.offGObjects, inner);
+            UD_LOG("GUObjectArray 命中记忆偏移 0x%x（ObjObjects@+0x%x Num@+0x%x chunk=1<<%d）",
+                   UE.offGObjects, gOA.innerOff, gOA.numOff, gOA.chunkShift);
             return true;
         }
         UD_LOG("记忆偏移 0x%x 校验失败，重新扫描", UE.offGObjects);
@@ -551,7 +591,6 @@ static bool ud_find_gobjects(void) {
            (unsigned long long)((scanHi - scanLo) >> 20));
 
     __block uint64_t found = 0;
-    __block uint32_t foundInner = 0;
     vmmapiterateentries(gVMMap, ^(uint64_t start, uint64_t end, uint64_t entry, BOOL *stop) {
         if (found || end <= scanLo || start >= scanHi) return;
         uint64_t page = start & ~0x3FFFULL;
@@ -559,11 +598,10 @@ static bool ud_find_gobjects(void) {
             uint64_t local = ud_map_remote_page(page);
             if (!local) continue;
             for (uint64_t o = 0; o < 0x4000ULL; o += 8) {
-                uint64_t V = page + o; // V 必须本身是全局地址（候选 GUObjectArray）
-                if (!ud_userland(V + 0x60)) continue; // 便宜的预过滤
-                uint32_t inner = 0;
-                if (ud_gobjects_confirms(V, gworldIdx, gGWorld, &inner)) {
-                    found = V; foundInner = inner;
+                uint64_t V = page + o; // 候选 GUObjectArray（须在映像内）
+                if (!ud_userland(V)) continue;
+                if (ud_gobjects_confirms(V, gworldIdx, gGWorld)) {
+                    found = V;
                     *stop = YES;
                     return;
                 }
@@ -573,14 +611,14 @@ static bool ud_find_gobjects(void) {
     ud_page_cache_flush(); // 扫描产生大量一次性映射，回收
 
     if (!found) {
-        ud_fail(@"GUObjectArray 自动扫描未命中——把控制台日志（GNames 附近条目布局）发回分析，或手动填 UE.offGObjects");
+        ud_fail(@"GUObjectArray 自动扫描未命中——把控制台日志发回分析，或手动填 UE.offGObjects");
         return false;
     }
     gGObjects = found;
     UE.offGObjects = (uint32_t)(found - gBase);
     [d setInteger:UE.offGObjects forKey:kUDGObjectsOffKey];
-    UD_LOG("GUObjectArray=0x%llx（base+0x%x，ObjObjects 在 +0x%x，已记忆）",
-           (unsigned long long)found, UE.offGObjects, foundInner);
+    UD_LOG("GUObjectArray=0x%llx（base+0x%x，ObjObjects@+0x%x Num@+0x%x chunk=1<<%d，已记忆）",
+           (unsigned long long)found, UE.offGObjects, gOA.innerOff, gOA.numOff, gOA.chunkShift);
     return true;
 }
 
@@ -633,11 +671,12 @@ typedef struct {
 #define UD_MAX_ENUMS   32768
 
 static void ud_dump_property(FILE *sdk, uint64_t prop, bool isFField) {
+    // FProperty：name@+0x28；旧式 UProperty：name@+0x18（UObject 布局）
     uint32_t nameIdx = isFField
         ? ud_kread32(prop + UE.ffieldName)
         : ud_kread32(prop + UE.uobjName);
-    char nameBuf[256];
-    if (!ud_name_from_index(nameIdx, nameBuf, sizeof(nameBuf))) return;
+    const char *nameBuf = ud_name_cached(nameIdx);
+    if (!nameBuf) return;
 
     // 属性类名（FProperty 的 FFieldClass* 名字 / 旧式 UProperty 的类对象名字）
     char clsName[128];
@@ -668,10 +707,10 @@ static void ud_dump_property(FILE *sdk, uint64_t prop, bool isFField) {
     fprintf(sdk, "    %s %s%s; // 0x%04X\n", type, nameBuf, dim > 1 ? "[]" : "", off);
 }
 
-// 生成一个函数签名注释行；fn 有效时返回 true（供 script.json 收集）
-static bool ud_dump_function(FILE *sdk, uint64_t func) {
-    char fname[256];
-    if (!ud_name_from_index(ud_kread32(func + UE.uobjName), fname, sizeof(fname))) return false;
+// 生成一个函数签名注释行
+static void ud_dump_function(FILE *sdk, uint64_t func) {
+    const char *fname = ud_name_cached(ud_kread32(func + UE.uobjName));
+    if (!fname) return;
 
     // 参数 = 函数的 ChildProperties（FProperty 链）
     char params[1024];
@@ -680,7 +719,8 @@ static bool ud_dump_function(FILE *sdk, uint64_t func) {
     uint64_t p = ud_kread64(func + UE.ustructChildProps);
     while (ud_userland(p) && used + 2 < sizeof(params)) {
         char pname[128] = "", pcls[64] = "";
-        ud_name_from_index(ud_kread32(p + UE.ffieldName), pname, sizeof(pname));
+        const char *pn = ud_name_cached(ud_kread32(p + UE.ffieldName));
+        if (pn) snprintf(pname, sizeof(pname), "%s", pn);
         uint64_t pc = ud_kread64(p + UE.ffieldClass);
         if (ud_userland(pc)) {
             const char *pcn = ud_obj_name(pc);
@@ -696,7 +736,6 @@ static bool ud_dump_function(FILE *sdk, uint64_t func) {
     while (pl > 0 && (params[pl - 1] == ' ' || params[pl - 1] == ',')) params[--pl] = 0;
 
     fprintf(sdk, "    // void %s(%s)\n", fname, params);
-    return true;
 }
 
 static void ud_dump_class(FILE *sdk, uint64_t klass) {
@@ -772,8 +811,8 @@ static void ud_dump_enum(FILE *sdk, uint64_t en) {
     fprintf(sdk, "\n// %s\nenum class E%s : int64_t {\n", path, leaf);
     for (int32_t i = 0; i < num; i++) {
         uint64_t pair = arr + (uint64_t)i * 16; // TPair<FName, int64>
-        char nbuf[256];
-        if (!ud_name_from_index(ud_kread32(pair), nbuf, sizeof(nbuf))) continue;
+        const char *nbuf = ud_name_cached(ud_kread32(pair));
+        if (!nbuf) continue;
         int64_t v = 0;
         ud_kreadbuf(pair + 8, &v, sizeof(v));
         fprintf(sdk, "    %s = %lld,\n", nbuf, (long long)v);
@@ -790,16 +829,13 @@ static bool ud_dump_all(NSString *outDir) {
     NSString *sdkPath = [outDir stringByAppendingPathComponent:@"SDK.hpp"];
     NSString *scriptPath = [outDir stringByAppendingPathComponent:@"script.json"];
 
-    // ---- GUObjectArray 概要（innerOff 复用确认逻辑）----
-    uint32_t innerOff = 0;
+    // ---- GUObjectArray 概要（复核并锁定布局）----
     uint32_t gworldIdx = ud_kread32(gGWorld + UE.uobjIndex);
-    if (!ud_gobjects_confirms(gGObjects, gworldIdx, gGWorld, &innerOff)) {
+    if (!ud_gobjects_confirms(gGObjects, gworldIdx, gGWorld)) {
         ud_fail(@"GUObjectArray 复核失败（状态变化）");
         return false;
     }
-    uint64_t chunksBase = ud_kread64(gGObjects + innerOff);
-    if (!ud_userland(chunksBase)) { ud_fail(@"chunks 数组指针无效"); return false; }
-    int32_t numE = (int32_t)ud_kread32(gGObjects + innerOff + 0xC);
+    int32_t numE = ud_uobject_count();
     if (numE <= 0 || numE > 0x10000000) { ud_fail(@"GUObjectArray Num 异常"); return false; }
     UD_LOG("开始遍历 %d 个对象…", numE);
 
@@ -822,9 +858,7 @@ static bool ud_dump_all(NSString *outDir) {
     int dumped = 0, nFuncs = 0;
 
     for (int32_t i = 0; i < numE; i++) {
-        uint64_t chunk = ud_kread64(chunksBase + (uint64_t)(i >> 6) * 8);
-        if (!ud_userland(chunk)) continue;
-        uint64_t item = ud_kread64(chunk + (uint64_t)(i & 63) * 0x18);
+        uint64_t item = ud_uobject_at((uint32_t)i);
         if (!ud_userland(item)) continue;
 
         uint64_t cls = ud_kread64(item + UE.uobjClass);
@@ -875,12 +909,13 @@ static bool ud_dump_all(NSString *outDir) {
         ud_fail(@"无法写 Offsets.txt");
         return false;
     }
-    fprintf(offs, "DumpTime: %s\n", [[NSDate date] description].UTF8String);
+    fprintf(offs, "DumpTime: %s\n", [[NSDate date] description].UTF8String ? [[NSDate date] description].UTF8String : "");
     fprintf(offs, "ImageBase: 0x%llx\n", (unsigned long long)gBase);
     fprintf(offs, "GWorld: 0x%llx (base + 0x%x)\n", (unsigned long long)gGWorld, UE.offGWorld);
-    fprintf(offs, "GNames/FNamePool: 0x%llx (base + 0x%x)\n", (unsigned long long)gGNames, UE.offGNames);
-    fprintf(offs, "GUObjectArray: 0x%llx (base + 0x%x, ObjObjects 内偏移 0x%x)\n",
-            (unsigned long long)gGObjects, UE.offGObjects, innerOff);
+    fprintf(offs, "GNames: 0x%llx (base + 0x%x, 定制 TNameEntryArray, indexMode=%d)\n",
+            (unsigned long long)gGNames, UE.offGNames, gNameIndexMode);
+    fprintf(offs, "GUObjectArray: 0x%llx (base + 0x%x, ObjObjects@+0x%x Num@+0x%x chunk=1<<%d)\n",
+            (unsigned long long)gGObjects, UE.offGObjects, gOA.innerOff, gOA.numOff, gOA.chunkShift);
     fprintf(offs, "ObjectCount: %d\n", numE);
     fclose(offs);
 
@@ -893,7 +928,6 @@ static bool ud_dump_all(NSString *outDir) {
     }
     fprintf(sdk, "// Generated by Rein UESDumper @ %s\n", [[NSDate date] description].UTF8String);
     fprintf(sdk, "// 类 %d / 函数 %d / 枚举 %d\n", nClasses, nFuncs, nEnums);
-    fprintf(sdk, "// 注意：字段/函数布局基于 stock UE4.25 默认偏移，若与游戏不符请修 UESDumper.mm 的 UE 配置区\n");
     fprintf(sdk, "#pragma once\n#include <cstdint>\n");
 
     UD_LOG("生成 SDK.hpp（类定义）…");
@@ -923,6 +957,8 @@ void UESDumperStart(void) {
     gUDError = @"";
     gUDOutput = @"";
     gBase = 0; gGWorld = 0; gGObjects = 0; gGNames = 0;
+    gNameIndexMode = 1;
+    gOA.innerOff = 0x10; gOA.numOff = 0x14; gOA.chunkShift = 16;
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
