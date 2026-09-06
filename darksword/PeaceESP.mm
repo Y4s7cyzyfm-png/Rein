@@ -507,9 +507,10 @@ enum {
     O_ADV_AI    = 0xB9C,  // 高级人机判断
     O_HP        = 0x1060, // 当前血量
     O_HPMAX     = 0x1068, // 最大血量
-    O_ACTION    = 0x1700, // 人物状态
+    O_ACTION    = 0x1700, // 人物动作
     O_RANK1     = 0x3334, // 一称判断
-    O_HEIGHT    = 0x10C0, // 人物高度
+    O_SPEED_DEF = 0x10BC, // 默认速度值（2026-09 表新标注；旧表曾标「人物高度」）
+    O_SPEED_CUR = 0x10C0, // 当前速度值（旧表 0x10C0 曾误标为高度）
     O_CROSSHAIR_ID = 0x3B9C, // 人物过滤/判断
 
     // 骨骼（预留，骨骼 ESP 用）
@@ -525,15 +526,17 @@ enum {
     // 击杀信息（对象地址 → 击杀指针 0x2988 → 击杀数量 0x2C；含击杀者/受害者名字）
     O_KILLLIST = 0x2988, O_KILLCOUNT = 0x2C,
 
-    // 载具（对象地址 → 载具指针 0xC00 → 耐久/油量；ID 0x20B0）
-    O_VEHICLE = 0xC00, O_VEHID = 0x20B0,
-    O_VEHHP = 0x1F8, O_VEHHPMAX = 0x1F4, O_VEHFUEL = 0x21C, O_VEHFUELMAX = 0x218,
+    // 载具（对象地址 → 载具指针 0xC00 → 耐久/油量；载具状态 0x1FD0）
+    O_VEHICLE = 0xC00, O_VEHID = 0x1FD0,
+    O_VEHHP = 0x1F4, O_VEHHPMAX = 0x1F8, O_VEHFUEL = 0x218, O_VEHFUELMAX = 0x21C,
 
-    // 准星（准星X 0x600 / 准星Y 0x604）
-    O_CROSSX = 0x600, O_CROSSY = 0x604,
+    // 准星（2026-09 表：指针 0x5E8、X 0x600；表内 Y=0x5E8 与指针同值，疑笔误，
+    // 暂保留相邻槽 0x604，接入功能时实测确认）
+    O_CROSSPTR = 0x5E8, O_CROSSX = 0x600, O_CROSSY = 0x604,
 
-    // 开火 / 开镜判断（对象地址；安卓表：开火 0x2750，开镜 0x1848）
-    O_FIRING = 0x2750, O_SCOPED = 0x1848,
+    // 开火 / 开镜判断（对象地址；2026-09 表：开火 0x1848，开镜 0x2750——
+    // 与旧安卓表标签互换，以新表为准）
+    O_FIRING = 0x1848, O_SCOPED = 0x2750,
 
     // 投掷物（组件 0x33B0 → 配置 0x130 → 更多配置 0x8 → 手雷爆炸时间 0x88C）
     O_THROWCOMP = 0x33B0, O_THROWCONF = 0x130, O_THROWMORE = 0x8, O_GRENADEFUSE = 0x88C,
