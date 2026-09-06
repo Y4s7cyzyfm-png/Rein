@@ -30,6 +30,7 @@
 		RN0000000000000000000B021 /* findcachedataoff.m in Sources */ = {isa = PBXBuildFile; fileRef = RN0000000000000000000F029 /* findcachedataoff.m */; };
 		RN0000000000000000000B027 /* PeaceESP.mm in Sources */ = {isa = PBXBuildFile; fileRef = RN0000000000000000000F036 /* PeaceESP.mm */; };
 		RN0000000000000000000B028 /* SilentKeepAlive.m in Sources */ = {isa = PBXBuildFile; fileRef = RN0000000000000000000F039 /* SilentKeepAlive.m */; };
+		RN0000000000000000000B029 /* UESDumper.mm in Sources */ = {isa = PBXBuildFile; fileRef = RN0000000000000000000F041 /* UESDumper.mm */; };
 		RN0000000000000000000B022 /* libxpf.dylib in Frameworks */ = {isa = PBXBuildFile; fileRef = RN0000000000000000000F030 /* libxpf.dylib */; };
 		RN0000000000000000000B023 /* libgrabkernel2.dylib in Frameworks */ = {isa = PBXBuildFile; fileRef = RN0000000000000000000F031 /* libgrabkernel2.dylib */; };
 		RN0000000000000000000B026 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = RN0000000000000000000F032 /* Assets.xcassets */; };
@@ -57,6 +58,8 @@
 		RN0000000000000000000F036 /* PeaceESP.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; name = PeaceESP.mm; path = darksword/PeaceESP.mm; sourceTree = SOURCE_ROOT; };
 		RN0000000000000000000F038 /* SilentKeepAlive.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = SilentKeepAlive.h; path = darksword/SilentKeepAlive.h; sourceTree = SOURCE_ROOT; };
 		RN0000000000000000000F039 /* SilentKeepAlive.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = SilentKeepAlive.m; path = darksword/SilentKeepAlive.m; sourceTree = SOURCE_ROOT; };
+		RN0000000000000000000F040 /* UESDumper.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = UESDumper.h; path = darksword/UESDumper.h; sourceTree = SOURCE_ROOT; };
+		RN0000000000000000000F041 /* UESDumper.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; name = UESDumper.mm; path = darksword/UESDumper.mm; sourceTree = SOURCE_ROOT; };
 		RN0000000000000000000F018 /* darksword.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = darksword.m; path = Vendor/darksword-kexploit/darksword.m; sourceTree = SOURCE_ROOT; };
 		RN0000000000000000000F019 /* offsets.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = offsets.m; path = Vendor/darksword-kexploit/offsets.m; sourceTree = SOURCE_ROOT; };
 		RN0000000000000000000F020 /* utils.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = utils.m; path = Vendor/darksword-kexploit/utils.m; sourceTree = SOURCE_ROOT; };
@@ -141,6 +144,8 @@
 				RN0000000000000000000F036 /* PeaceESP.mm */,
 				RN0000000000000000000F038 /* SilentKeepAlive.h */,
 				RN0000000000000000000F039 /* SilentKeepAlive.m */,
+				RN0000000000000000000F040 /* UESDumper.h */,
+				RN0000000000000000000F041 /* UESDumper.mm */,
 			);
 			path = darksword;
 			sourceTree = "<group>";
@@ -298,6 +303,7 @@
 				RN0000000000000000000B021 /* findcachedataoff.m in Sources */,
 				RN0000000000000000000B027 /* PeaceESP.mm in Sources */,
 				RN0000000000000000000B028 /* SilentKeepAlive.m in Sources */,
+				RN0000000000000000000B029 /* UESDumper.mm in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

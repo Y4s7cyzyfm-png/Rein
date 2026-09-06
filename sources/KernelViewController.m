@@ -7,6 +7,8 @@
 #import "MD3Theme.h"
 #import "MD3Components.h"
 #import "ReinBridge.h"
+#import "UESDumper.h"
+#import <unistd.h>
 
 #pragma mark - Console log viewer（内核页「控制台日志」实时查看器）
 
@@ -544,8 +546,38 @@
 }
 
 - (void)dumpSDKTapped:(MD3FilledButton *)sender {
-    // 占位：后续接入实际的 UE4 SDK Dump 功能。
-    [self showToast:@"Dump UE4 SDK 功能开发中，敬请期待"];
+    if (UESDumperIsRunning()) return; // 进行中不重复触发
+
+    if (!ReinKernelIsReady()) {
+        [self showToast:@"请先初始化 DarkSword 内核"];
+        return;
+    }
+
+    [sender setEnabled:NO];
+    [sender setTitle:@"Dumping…（进度见控制台日志）"];
+    UESDumperStart();
+
+    // 后台等 dump 收尾，回主线程复位按钮并提示结果
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        while (UESDumperIsRunning()) {
+            usleep(300000);
+        }
+        NSString *error = UESDumperLastError();
+        NSString *output = UESDumperLastOutputPath();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            [strongSelf.dumpSDKButton setEnabled:YES];
+            [strongSelf.dumpSDKButton setTitle:@"Dump UE4 SDK"];
+            if (error.length > 0) {
+                [strongSelf showToast:[NSString stringWithFormat:@"Dump 失败：%@", error]];
+            } else if (output.length > 0) {
+                [strongSelf showToast:[NSString
+                    stringWithFormat:@"Dump 完成（Documents/SDK，Files 可查看）"]];
+            }
+        });
+    });
 }
 
 - (void)consoleLogTapped:(MD3FilledButton *)sender {
