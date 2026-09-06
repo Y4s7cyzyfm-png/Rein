@@ -566,13 +566,14 @@ static struct {
 static const uint32_t gUDInner[]  = { 0x10, 0x00, 0x08, 0x18, 0x20 };
 static const uint32_t gUDNum[]    = { 0x14, 0x0C, 0x08, 0x10, 0x18 };
 static const int      gUDShift[]  = { 16, 14, 13, 6, 0 }; // 0 = 平铺
-static const uint32_t gUDStride[] = { 0x18, 0x20, 0x08 };
+static const uint32_t gUDStride[] = { 0x18, 0x20, 0x08, 0x10, 0x28, 0x30 };
 static const uint32_t gUDObjOff[] = { 0x00, 0x08 };
 #define UD_ARR_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
 static int gUDNearMiss = 0;           // 高价值近失日志配额（Num ≥ gworldIdx/2 才记）
 static uint64_t gUDNearMissLastV = 0; // 去重：同 V 的全部组合只记一条
 static long gUDNearMissJunk = 0;      // 低价值近失计数（字节花纹垃圾，仅汇总）
+static long gUDSkippedBig = 0;        // 值扫描跳过的超大区域数（共享缓存等）
 
 static const char *ud_oa_desc(void) {
     static char buf[80];
@@ -612,8 +613,8 @@ static bool ud_is_named_uobject(uint64_t obj) {
 #define UD_MEMO_IDX_GW 8 // item 槽位下标：0..7 = 头部 idx，8 = gworldIdx
 typedef struct {
     uint64_t V;
-    uint64_t item[5][5][3][2][9];
-    bool set[5][5][3][2][9];
+    uint64_t item[5][5][6][2][9];
+    bool set[5][5][6][2][9];
 } UDOAMemo;
 static UDOAMemo gOAMemo;
 
@@ -936,7 +937,13 @@ static bool ud_value_scan_find_array(uint32_t gworldIdx, uint64_t gworld,
     vmmapiterateentries(gVMMap, ^(uint64_t start, uint64_t end, uint64_t entry, BOOL *stop) {
         if (nR >= 2048) { *stop = YES; return; }
         if (start < 0x100000000ULL || start >= 0x80000000000ULL) return;
-        if (end - start < 0x40000ULL || end - start > 0x80000000ULL) return; // 256KB..2GB
+        // 256KB..256MB：更大的区域是 dyld 共享缓存（第五轮真机实测：
+        // [0x180000000,0x1fa000000) 1952MB 以 ~1MB/s 磨半小时也扫不完，
+        // 且系统库里绝不会有 GUObjectArray）或显卡/文件大映射，直接跳过
+        if (end - start < 0x40000ULL || end - start > 0x10000000ULL) {
+            if (end - start > 0x10000000ULL) gUDSkippedBig++;
+            return;
+        }
         if (start < imgHi && end > imgLo) return; // 主映像自身不扫
         regs[nR].start = start; regs[nR].end = end; nR++;
     });
@@ -958,7 +965,8 @@ static bool ud_value_scan_find_array(uint32_t gworldIdx, uint64_t gworld,
         }
         regs[j + 1] = key;
     }
-    UD_LOG("值扫描：%d 个大块区域（按距堆锚点距离排序）", nR);
+    UD_LOG("值扫描：%d 个大块区域（按距堆锚点距离排序，另跳过 %ld 个超大区域）",
+           nR, gUDSkippedBig);
 
     bool ok = false;
     for (int r = 0; r < nR && !ok; r++) {
@@ -980,9 +988,12 @@ static bool ud_value_scan_find_array(uint32_t gworldIdx, uint64_t gworld,
                     for (size_t e = 0; e < UD_ARR_LEN(gUDObjOff) && !ok; e++) {
                         uint32_t off = gUDObjOff[e];
                         if (off >= s) continue;           // 8 字节数组只有 +0
-                        if ((hit - off) % s) continue;    // 槽位须整除对齐
+                        // 注意：不做 (hit-off)%s 整除检查——数组基址只保证
+                        // 16 字节对齐，stride 非 2 的幂（0x18/0x28）时基址
+                        // %s ≠ 0，整除检查会误杀真实命中（第五轮已踩坑）
                         uint64_t base = hit - off - (uint64_t)gworldIdx * s;
                         if (base > hit || base < 0x100000000ULL) continue; // 回绕
+                        if (base & 0xF) continue;         // malloc 16 字节对齐
                         // 验证：头 6 项 ≥4 个合法 UObject，且 idx+1 邻居合法
                         int good = 0;
                         for (int k = 0; k < 6; k++) {
@@ -1600,6 +1611,7 @@ void UESDumperStart(void) {
     gOA.innerOff = 0x10; gOA.numOff = 0x14; gOA.chunkShift = 16;
     gOA.itemStride = 0x18; gOA.itemObjOff = 0; gOA.weakAnchor = false;
     gUDNearMiss = 0; gUDNearMissLastV = 0; gUDMapFail = 0; gUDNearMissJunk = 0;
+    gUDSkippedBig = 0;
     gOAMemo.V = 0;
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
