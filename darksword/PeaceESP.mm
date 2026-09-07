@@ -477,13 +477,6 @@ static BOOL pe_inv_arg(uint64_t inv, const void *bytes, size_t size, NSUInteger 
     return YES;
 }
 
-// 热路径：setHidden:（BOOL 参数经 setArgument 传入，不走 withObject 包装）
-static BOOL pe_inv_hidden(uint64_t inv, bool hidden) {
-    if (!gRC || !gRC.trojanMem || !inv) return NO;
-    BOOL value = hidden; // BOOL = signed char（arm64 上 1 字节）
-    return pe_inv_arg(inv, &value, sizeof(value), 2) && pe_inv_invoke(inv);
-}
-
 // 热路径：投递到 SB 主线程执行——waitUntilDone:NO！
 // YES 会让 trojan 线程阻塞等 SB 主线程，主队列积压时一等就是秒级，
 // 触发 RemoteCall 超时失步。NO 投递即返回；主队列 FIFO 保序，
@@ -493,6 +486,13 @@ static BOOL pe_inv_hidden(uint64_t inv, bool hidden) {
 // 排队 fault 上并毒化会话快速失败，绝不拿污染的 sp/寄存器跑下一个调用。）
 static BOOL pe_inv_invoke(uint64_t inv) {
     return pe_perform_main(inv, pe_sel("invoke"), 0, NO);
+}
+
+// 热路径：setHidden:（BOOL 参数经 setArgument 传入，不走 withObject 包装）
+static BOOL pe_inv_hidden(uint64_t inv, bool hidden) {
+    if (!gRC || !gRC.trojanMem || !inv) return NO;
+    BOOL value = hidden; // BOOL = signed char（arm64 上 1 字节）
+    return pe_inv_arg(inv, &value, sizeof(value), 2) && pe_inv_invoke(inv);
 }
 
 // 工厂方法结果立即 retain，跨 performSelector 轮次保活（DSBridge 经验）
