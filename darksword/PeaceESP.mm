@@ -465,12 +465,9 @@ static BOOL pe_inv_arg(uint64_t inv, const void *bytes, size_t size, NSUInteger 
 // YES 会让 trojan 线程阻塞等 SB 主线程，主队列积压时一等就是秒级，
 // 触发 RemoteCall 超时失步。NO 投递即返回；主队列 FIFO 保序，
 // newest-wins 语义可接受。
-// （0x401 崩溃的真正根因已在 TaskRop/RemoteCall.m 修复：旧协议每次调用
-// 结束都回复 pc=0x401 让 trojan 线程重 fault「停泊」，异常消息在两次调用
-// 之间落进端口队列、无人在 waitexc 监听；出框时每秒数百次调用，任何一次
-// 投递失败/失步 = SIGBUS = SpringBoard 注销。现改为持有异常模式：返回陷阱
-// 的消息接收后不回复，线程悬停在内核异常等待里，端口保持空，唯一的 fault
-// 只发生在 waitexc 监听窗口内。）
+// （SpringBoard 注销的防护在 TaskRop/RemoteCall.m：稳定路径 waitexc#1 校验
+// park 陷阱，中途 fault（污染状态）一律拒绝复用——回复原状态让线程停在
+// 排队 fault 上并毒化会话快速失败，绝不拿污染的 sp/寄存器跑下一个调用。）
 static BOOL pe_inv_invoke(uint64_t inv) {
     return pe_perform_main(inv, pe_sel("invoke"), 0, NO);
 }
