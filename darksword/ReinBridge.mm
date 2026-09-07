@@ -72,7 +72,7 @@ static int rein_log_file_fd(void) {
         NSString *path = [docs stringByAppendingPathComponent:@"rein.log"];
         // 保留最近 ~4MB：防止长会话无限膨胀（重命名旧的，下次启动自然丢弃）
         NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
-        if ([attrs.fileSize unsignedLongLongValue] > 4 * 1024 * 1024) {
+        if (attrs.fileSize > 4ULL * 1024 * 1024) {
             NSString *old = [docs stringByAppendingPathComponent:@"rein.log.1"];
             [[NSFileManager defaultManager] removeItemAtPath:old error:nil];
             [[NSFileManager defaultManager] moveItemAtPath:path toPath:old error:nil];
