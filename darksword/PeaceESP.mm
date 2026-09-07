@@ -110,7 +110,7 @@ static void pe_detail(NSString *detail) {
 #define PE_OVERLAY_PROCESS  "SpringBoard"
 #define PE_GAME_PROCESS     "ShadowTrackerExtra"
 #define PE_MAX_ENEMIES       60
-#define PE_DEFAULT_INTERVAL  0.033
+#define PE_DEFAULT_INTERVAL  0.050 // 20fps：RemoteCall 吞吐有限，30fps 高压会失步（真机崩 SB 实锤）
 #define PE_FAR_CLIP          40000.0f
 #define PE_PLAYER_HEIGHT     175.0f
 
@@ -146,6 +146,7 @@ static double   gSW = 0, gSH = 0;
 static int      gVis = 0, gMyTeam = -1;
 static uint64_t gFrames = 0, gGameBase = 0;
 static PE_Vec3  gMyPos = {0};
+static long gRemoteFail = 0; // 远程调用连续失败计数（>30 熔断，防 RemoteCall 失步崩 SB）
 
 // ============================================================
 // 游戏内存读取基础设施（vm_object 映射 + 远程页缓存）
@@ -408,12 +409,16 @@ static BOOL pe_invoke_main_result(uint64_t target, uint64_t selector,
             if (!gRC.trojanMem) return NO;
             if (![gRC remoteRead:resultScratch to:result size:(uint64_t)resultSize]) return NO;
         }
+        gRemoteFail = 0; // 成功：清零连续失败计数
         return YES;
     } @finally {
         if (gRC.trojanMem) {
             remote_msg(gRC, autoreleasePool, drainSelector, 0, 0, 0, 0);
         }
     }
+    // 失败路径统一计账（@finally 不可 return，这里补记）：
+    // 连续失败 >30 触发帧循环熔断，防止 RemoteCall 失步后打爆 SpringBoard
+    gRemoteFail++;
 }
 
 static BOOL pe_call_main_noarg(uint64_t target, const char *selectorName) {
@@ -1198,6 +1203,7 @@ static bool pe_overlay_create(void) {
                 pe_set_double_main(layer, "setBorderWidth:", 2.0);
                 if (greenCGColor) pe_perform_main(layer, pe_sel("setBorderColor:"), greenCGColor, YES);
             }
+            pe_set_double_main(box, "setAlpha:", 0.85); // 一次性设置，帧循环不再重复
             pe_set_u64_main(box, "setHidden:", 1);
             pe_perform_main(window, pe_sel("addSubview:"), box, YES);
         }
@@ -1239,30 +1245,83 @@ static bool pe_overlay_create(void) {
 }
 
 // ============================================================
-// 第 4 层：更新 views
+// 第 4 层：更新 views（状态缓存——只在变化时发远程调用）
 // ============================================================
+// RemoteCall 机制：每次远程调用 =「等 trap → 改寄存器 → 恢复 → 等 0x401
+// 返回 trap」。一旦某调用超时/异常端口无人监听，trojan 线程跳回 0x401
+// 就是裸 SIGBUS → SpringBoard 注销（2026-09-07 真机实锤）。NSInvocation
+// 路径每次 ~10 个远程调用，60 槽 × 3 视图 × 30fps = 每秒数万次，必然失步。
+// 因此：稳态（无变化）零调用；矩形/文字/可见性变更才调用；文字再按帧节流。
+
+typedef struct {
+    bool shown;
+    double x, y, w, h;
+    char text[24]; // label 用（名字/距离），空串 = 无
+} PESlotState;
+static PESlotState gBoxSt[PE_MAX_ENEMIES], gNameSt[PE_MAX_ENEMIES], gDistSt[PE_MAX_ENEMIES];
+
+static void pe_slot_states_reset(void) {
+    memset(gBoxSt, 0, sizeof(gBoxSt));
+    memset(gNameSt, 0, sizeof(gNameSt));
+    memset(gDistSt, 0, sizeof(gDistSt));
+}
 
 static void pe_box(int i, PE_Rect r, bool v) {
     if (i < 0 || i >= PE_MAX_ENEMIES) return;
     uint64_t bx = gBox[i]; if (!bx) return;
-    if (!v) { pe_set_u64_main(bx, "setHidden:", 1); return; }
-    pe_set_rect_main(bx, "setFrame:", CGRectMake(r.x, r.y, r.width, r.height));
-    pe_set_double_main(bx, "setAlpha:", 0.85);
-    pe_set_u64_main(bx, "setHidden:", 0);
+    PESlotState *st = &gBoxSt[i];
+    if (!v) {
+        if (st->shown) {
+            if (pe_set_u64_main(bx, "setHidden:", 1)) st->shown = false;
+        }
+        return;
+    }
+    // 变更才 setFrame（>1px 抖动抑制）；显示状态切换才 setHidden
+    bool moved = !st->shown ||
+                 fabs(st->x - r.x) > 1 || fabs(st->y - r.y) > 1 ||
+                 fabs(st->w - r.width) > 1 || fabs(st->h - r.height) > 1;
+    if (moved) {
+        if (pe_set_rect_main(bx, "setFrame:", CGRectMake(r.x, r.y, r.width, r.height))) {
+            st->x = r.x; st->y = r.y; st->w = r.width; st->h = r.height;
+        }
+    }
+    if (!st->shown) {
+        if (pe_set_u64_main(bx, "setHidden:", 0)) st->shown = true;
+    }
 }
 
-static void pe_lbl(uint64_t lb, NSString *text, PE_Rect r, bool v) {
+static void pe_lbl(int i, uint64_t lb, const char *text, PE_Rect r, bool v) {
     if (!lb) return;
-    if (!v || !text) { pe_set_u64_main(lb, "setHidden:", 1); return; }
-    uint64_t ns = pe_nsstring(text);
-    if (ns) {
-        pe_perform_main(lb, pe_sel("setText:"), ns, YES);
-        uint64_t release = pe_sel("release");
-        if (release && gRC.trojanMem) remote_msg(gRC, ns, release, 0, 0, 0, 0);
-        pe_set_rect_main(lb, "setFrame:", CGRectMake(r.x, r.y, r.width, r.height));
-        pe_set_u64_main(lb, "setHidden:", 0);
-    } else {
-        pe_set_u64_main(lb, "setHidden:", 1);
+    PESlotState *st = (i >= 0 && i < PE_MAX_ENEMIES)
+        ? ((lb == gName[i]) ? &gNameSt[i] : &gDistSt[i]) : NULL;
+    if (!v || !text || !text[0]) {
+        if (st && st->shown) {
+            if (pe_set_u64_main(lb, "setHidden:", 1)) st->shown = false;
+        }
+        return;
+    }
+    bool textChanged = !st || !st->shown || strcmp(st->text, text) != 0;
+    bool moved = !st || !st->shown ||
+                 fabs(st->x - r.x) > 1 || fabs(st->y - r.y) > 1 ||
+                 fabs(st->w - r.width) > 1 || fabs(st->h - r.height) > 1;
+    if (!textChanged && !moved) return; // 稳态：零远程调用
+    if (textChanged) {
+        NSString *ns = [NSString stringWithUTF8String:text];
+        uint64_t rns = pe_nsstring(ns);
+        if (rns) {
+            BOOL ok = pe_perform_main(lb, pe_sel("setText:"), rns, YES);
+            uint64_t release = pe_sel("release");
+            if (release && gRC.trojanMem) remote_msg(gRC, rns, release, 0, 0, 0, 0);
+            if (ok && st) snprintf(st->text, sizeof(st->text), "%s", text);
+        }
+    }
+    if (moved) {
+        if (pe_set_rect_main(lb, "setFrame:", CGRectMake(r.x, r.y, r.width, r.height))) {
+            if (st) { st->x = r.x; st->y = r.y; st->w = r.width; st->h = r.height; }
+        }
+    }
+    if (st && !st->shown) {
+        if (pe_set_u64_main(lb, "setHidden:", 0)) st->shown = true;
     }
 }
 
@@ -1301,6 +1360,7 @@ static void peace_esp_tick(void) {
     int onscreen = 0;
     int vi = 0;
     PE_Rect zeroRect = {0, 0, 0, 0};
+    bool textTick = (gFrames % 10) == 0; // 文字（名字/距离）每 10 帧才更新一次
     for (int i = 0; i < n && vi < PE_MAX_ENEMIES; i++) {
         PE_Enemy *e = &es[i];
         PE_Vec2S tp = w2s(e->top, &cam, gSW, gSH);
@@ -1320,19 +1380,33 @@ static void peace_esp_tick(void) {
         PE_Rect boxRect = {x, y, (double)w, (double)h};
         pe_box(vi, boxRect, true);
         PE_Rect nameRect = {x - 10, y - 18, (double)w + 20, 16};
-        pe_lbl(gName[vi], (e->name.length > 0 ? e->name : (e->isAI ? @"BOT" : @"Player")), nameRect, true);
-        char ds[32];
+        char nb[24] = "Player";
+        if (e->name.length > 0) {
+            snprintf(nb, sizeof(nb), "%s", e->name.UTF8String ?: "Player");
+        } else if (e->isAI) {
+            snprintf(nb, sizeof(nb), "BOT");
+        }
+        pe_lbl(vi, gName[vi], textTick ? nb : NULL, nameRect, true);
+        char ds[24];
         snprintf(ds, sizeof(ds), "%.0fm", e->distance / 100.0f);
         PE_Rect distRect = {x - 10, (double)y + h + 2, (double)w + 20, 16};
-        pe_lbl(gDist[vi], [NSString stringWithUTF8String:ds], distRect, true);
+        pe_lbl(vi, gDist[vi], textTick ? ds : NULL, distRect, true);
         vi++;
     }
     for (int i = vi; i < PE_MAX_ENEMIES; i++) {
         pe_box(i, zeroRect, false);
-        pe_lbl(gName[i], nil, zeroRect, false);
-        pe_lbl(gDist[i], nil, zeroRect, false);
+        pe_lbl(i, gName[i], NULL, zeroRect, false);
+        pe_lbl(i, gDist[i], NULL, zeroRect, false);
     }
     gVis = vi;
+
+    // 熔断：远程调用连续失败说明 RemoteCall 已失步——继续打调用只会让
+    // trojan 线程裸跳 0x401 崩掉 SpringBoard，立即停止 ESP
+    if (gRemoteFail > 30) {
+        PE_LOG_ERROR("远程调用连续失败 %ld 次，RemoteCall 失步——停止 ESP 防止 SpringBoard 崩溃", gRemoteFail);
+        gRun = false;
+        return;
+    }
 
     // 绘制诊断：前 3 帧每帧打一次，之后约 5 秒采样一次（防 30fps 刷屏）
     static int sDrawDiagLogged = 0;
@@ -1384,6 +1458,8 @@ void PeaceESPStart(void) {
     gFrames = 0; gVis = 0;
     gLocOff = 0x200; gPovLocOff = 0x650; gCamFromSelfChain = false;
     gCalibFail = 0; gVpSanityFail = 0; gMyPosLogged = false;
+    gRemoteFail = 0;
+    pe_slot_states_reset();
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
