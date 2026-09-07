@@ -1179,7 +1179,12 @@ static int pe_actors(PE_Enemy *out, int max) {
         e->isAI = (kread32(a + O_AI) & 0xFF) != 0; e->isDead = false;
         e->teamID = (int)kread32(a + O_TEAM);
         e->name = pe_actor_name(a);
-        e->bottom = loc; e->top = loc; e->top.z += PE_PLAYER_HEIGHT;
+        // UE4 RootComponent = CapsuleComponent：坐标是胶囊中心（离地 ~88cm），
+        // 不是脚底——2026-09-08 真机实锤「框整体偏出人身」：旧代码把中心当
+        // 脚底、+175 当头顶，框整体高出约一个身位。按胶囊中心语义展开：
+        // 脚 = 中心-88，头 = 中心+87（身高 ~175）
+        e->bottom = loc; e->bottom.z -= 88.0f;
+        e->top = loc;    e->top.z += 87.0f;
         w++;
     }
     return w;
@@ -1533,6 +1538,28 @@ static void peace_esp_tick(void) {
         sLoggedCount++;
     }
     PE_TRACE("tick %llu enemies=%d", (unsigned long long)gFrames, n);
+    // 投影自检（tick 0 一次 + 每 150 帧采样）：校准框偏移的三要素——
+    // ① 相机前方 500cm 的点投影必须 ≈ 屏幕正中心（验证 pitch/yaw/向量数学）；
+    // ② 自身 pawn 投影应在屏幕中下部（TPP 人物位置，验证相机源与比例）；
+    // ③ 中心参考值。下次日志发回即可精确定位剩余偏差来源。
+    static int sW2sDiagLogged = 0;
+    if (sW2sDiagLogged < 3 || (gFrames % 150) == 0) {
+        sW2sDiagLogged++;
+        float pr = cam.rot.x * (float)M_PI / 180.0f;
+        float ya = cam.rot.y * (float)M_PI / 180.0f;
+        PE_Vec3 fwdPt = {
+            cam.loc.x + cosf(pr) * cosf(ya) * 500.0f,
+            cam.loc.y + cosf(pr) * sinf(ya) * 500.0f,
+            cam.loc.z + sinf(pr) * 500.0f,
+        };
+        PE_Vec2S fwd = w2s(fwdPt, &cam, gSW, gSH);
+        PE_Vec2S selfPt = w2s(gMyPos, &cam, gSW, gSH);
+        PE_LOG("投影自检：中心=(%.0f,%.0f) 前方点->(%.0f,%.0f)%@ 自身->(%.0f,%.0f)%@"
+               "（前方点须≈中心；自身应在中下方——偏差方向告诉我即可修）",
+               gSW * 0.5, gSH * 0.5,
+               fwd.x, fwd.y, fwd.visible ? @"" : @"(不可见)",
+               selfPt.x, selfPt.y, selfPt.visible ? @"" : @"(不可见)");
+    }
     int w2sVisible = 0;
     int onscreen = 0;
     int vi = 0;
@@ -1671,7 +1698,7 @@ void PeaceESPStart(void) {
                 return;
             }
 
-            PE_LOG("=== start (build 20260907-k, exc-port probe) ===（Console.app 过滤 subsystem: com.rein.peaceesp）");
+            PE_LOG("=== start (build 20260907-l, probe fix + capsule z + w2s diag) ===（Console.app 过滤 subsystem: com.rein.peaceesp）");
             if (!pe_init_game()) {
                 pe_fail(@"游戏初始化失败（vm_map / 基址扫描），详细日志见 Console.app（subsystem: com.rein.peaceesp）。");
                 return;
