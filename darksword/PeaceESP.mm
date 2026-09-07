@@ -550,6 +550,30 @@ enum {
 
     // 掩体判断（自身 → 玩家控制器 0x60C8 → 相机指针 0x680；调用 Controller.LineOfSightTo）
     O_PC_FROM_PAWN = 0x60C8,
+
+    // ── 以下为 1.38.12 SDK（和平精英.1.38.12-SDK.h）实测布局，功能逐步接入 ──
+    // PlayerCameraManager（= PlayerController+0x680）：
+    O_PCM_CACHE = 0x640,   // CameraCache（CameraCacheEntry 内嵌，Size 1840）
+    O_PCM_POV   = 0x10,    // CameraCacheEntry.POV（MinimalViewInfo 内嵌）
+    // CameraCacheEntry.TimeStamp@+0x00（float，旧代码曾把它当 POV 的一部分）
+    O_MVI_LOC = 0x00,      // MinimalViewInfo.Location
+    O_MVI_ROT = 0x18,      // MinimalViewInfo.Rotation（旧代码误当 +0xC）
+    O_MVI_FOV = 0x30,      // MinimalViewInfo.FOV（旧代码误当 +0x18）
+    O_PCM_LASTCACHE = 0xD70, // LastFrameCameraCache
+    O_PCM_VIEWTARGET = 0x14A0, // TViewTarget（Actor 指针开头）
+    O_PCM_CACHEDPOV = 0x2320, // CachedViewPOV（直接内嵌 MinimalViewInfo）
+    // SceneComponent：
+    O_RC_RELLOC = 0x1CC,   // RelativeLocation（相对坐标，ESP 不用）
+    O_RC_WORLD  = 0x1F0,   // ComponentToWorld（FTransform：四元数@+0x00、平移@+0x10）
+    // Controller / PlayerController：
+    O_CTRL_PAWN = 0x5D8,   // Controller.Pawn（stock；游戏改版链 0x3540 实测有效，保留）
+    O_CTRL_ROT  = 0x620,   // Controller.ControlRotation（Rotator）
+    O_PC_ACKPAWN = 0x660,  // PlayerController.AcknowledgedPawn
+    // UWorld 补充：
+    O_WORLD_GAMEINSTANCE = 0xB20, // OwningGameInstance
+    // 函数地址（SDK 中为 IDA vmaddr，减 0x100000000 得映像偏移；调用 = base + off）：
+    O_FUNC_LINEOFSIGHT = 0xAB8F878,      // Controller.LineOfSightTo（掩体判断）
+    O_FUNC_SETCTRLROT  = 0xAB8FAA4,      // Controller.SetControlRotation（自瞄备用）
 };
 
 // ---- 运行时偏移校准（2026-09-06 真机：相机 POV 读数 rot=(0,0,0)/loc≈0，
@@ -557,8 +581,12 @@ enum {
 // 锚点：相机 POV.Location 必然紧邻自身 Pawn 的 RootComponent 坐标
 // （TPP 相机在人物身后 0~5 米）。对 RootComponent 与相机对象做候选向量
 // 联合扫描，距离 < 1500cm 的组合即正确偏移对。
-static uint32_t gLocOff = 0;     // RootComponent 内 Location 偏移（0 = 未校准，回落 O_LOC）
-static uint32_t gPovLocOff = 0;  // 相机对象内 POV.Location 偏移（0 = 未校准）
+// 初值 = SDK 1.38.12 实测（非 0 即跳过启动校准，直接按正确布局读；
+// 连续合理性失败时仍会自动重校准兜底）：
+//   gLocOff    = ComponentToWorld(0x1F0)+平移(0x10) = 0x200（世界坐标）
+//   gPovLocOff = CameraCache(0x640)+POV(0x10) = 0x650
+static uint32_t gLocOff = 0x200;    // RootComponent 内世界坐标偏移
+static uint32_t gPovLocOff = 0x650; // 相机对象内 POV.Location 偏移
 static bool gCamFromSelfChain = false; // 相机链选择（false = pawn+0x60C8 链）
 static int gCalibFail = 0;       // 校准失败计数（限流 dump）
 static int gVpSanityFail = 0;    // POV 合理性连续失败计数（超限重置校准）
@@ -810,12 +838,12 @@ static bool pe_calibrate_offsets(uint64_t rc, uint64_t camPtr) {
             float d = sqrtf(dx * dx + dy * dy + dz * dz);
             if (d >= bestDist) continue;
             PE_Vec3 r;
-            memcpy(&r, camBuf + o + 0xC, 12);
+            memcpy(&r, camBuf + o + 0x18, 12); // MVI.Rotation@+0x18（SDK）
             if (r.x < -95.0f || r.x > 95.0f) continue;   // Pitch
             if (r.y < -185.0f || r.y > 185.0f) continue; // Yaw
             if (r.z < -185.0f || r.z > 185.0f) continue; // Roll
             float fov;
-            memcpy(&fov, camBuf + o + 0x18, 4);
+            memcpy(&fov, camBuf + o + 0x30, 4);  // MVI.FOV@+0x30（SDK）
             if (fov < 40.0f || fov > 120.0f) continue;
             bestDist = d; bestRc = oRc; bestPov = o;
         }
@@ -890,16 +918,22 @@ static bool pe_vp(PECamera *cam) {
     }
     uint64_t camPtr = gCamFromSelfChain ? camB : camA;
     if (!(camPtr >= 0x100000000ULL && camPtr < 0x800000000ULL)) {
+        // 首选链无效 → 自动换另一条（SDK 直读模式下两条链等价，都到 PC+0x680）
+        camPtr = gCamFromSelfChain ? camA : camB;
+        gCamFromSelfChain = !gCamFromSelfChain;
+    }
+    if (!(camPtr >= 0x100000000ULL && camPtr < 0x800000000ULL)) {
         if (gFailVp < 3) {
-            PE_LOG_ERROR("相机链断链：camPtr=0x%llx（链=%@）",
-                         (unsigned long long)camPtr,
-                         gCamFromSelfChain ? @"自身链" : @"安卓表链");
+            PE_LOG_ERROR("相机链断链：camA=0x%llx camB=0x%llx",
+                         (unsigned long long)camA, (unsigned long long)camB);
             gFailVp++;
         }
         return false;
     }
-    // POV（校准锁定偏移）：Location / Rotation(+0xC) / FOV(+0x18)，一次读完
-    unsigned char buf[0x1C];
+    // POV（SDK 1.38.12 实测布局）：MinimalViewInfo 内 Location@+0x00 /
+    // Rotation@+0x18 / FOV@+0x30（旧代码把 Rotation 当 Location 读——上轮
+    // loc=(-0.7,-18.5,0) 正是旋转角度，rot=(0,0,0) 是 ViewTag，实锤）
+    unsigned char buf[0x34];
     if (!kreadbuf(camPtr + gPovLocOff, buf, sizeof(buf))) {
         if (gFailVp < 3) {
             PE_LOG_ERROR("POV 读取失败：相机=0x%llx +0x%x",
@@ -909,8 +943,8 @@ static bool pe_vp(PECamera *cam) {
         return false;
     }
     memcpy(&cam->loc, buf, 12);
-    memcpy(&cam->rot, buf + 0xC, 12);
-    memcpy(&cam->fov, buf + 0x18, 4);
+    memcpy(&cam->rot, buf + 0x18, 12);
+    memcpy(&cam->fov, buf + 0x30, 4);
     // 合理性校验：FOV 10..170，位置在用户态量级
     if (cam->fov < 10.0f || cam->fov > 170.0f ||
         fabsf(cam->loc.x) > 1e7f || fabsf(cam->loc.y) > 1e7f || fabsf(cam->loc.z) > 1e7f) {
@@ -1348,7 +1382,7 @@ void PeaceESPStart(void) {
     gLastError = @"";
     gLastErrorDetail = @"";
     gFrames = 0; gVis = 0;
-    gLocOff = 0; gPovLocOff = 0; gCamFromSelfChain = false;
+    gLocOff = 0x200; gPovLocOff = 0x650; gCamFromSelfChain = false;
     gCalibFail = 0; gVpSanityFail = 0; gMyPosLogged = false;
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
