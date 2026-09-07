@@ -435,6 +435,14 @@ static uint64_t pe_get_main(uint64_t target, const char *selectorName) {
 static uint64_t gBoxFrameInv[PE_MAX_ENEMIES];
 static uint64_t gNameFrameInv[PE_MAX_ENEMIES], gNameTextInv[PE_MAX_ENEMIES];
 static uint64_t gDistFrameInv[PE_MAX_ENEMIES], gDistTextInv[PE_MAX_ENEMIES];
+// setHidden: 也走持久化 invocation：绝不能用 performSelectorOnMainThread:
+// withObject: 传裸整数（0/1）——Foundation 内部会用 __NSSingleObjectArrayI
+// 之类包装 withObject 参数：nil 可能抛 NSInvalidArgumentException，0x1 会在
+// 包装数组释放时对野指针发 release（崩溃报告 x0 符号多次命中
+// __NSSingleObjectArrayI dealloc，且死亡时机 = 首次画框调 setHidden:）。
+// 传 nil 给无参的 invoke 不受影响（参数被忽略，DSBridge 原版验证过）。
+static uint64_t gBoxHiddenInv[PE_MAX_ENEMIES];
+static uint64_t gNameHiddenInv[PE_MAX_ENEMIES], gDistHiddenInv[PE_MAX_ENEMIES];
 
 // 一次性创建并 retain 常驻 invocation（仅 overlay 创建期调用）。
 // 故意不建 autorelease pool：invocation/signature 泄漏（永不释放）正是目的。
@@ -467,6 +475,13 @@ static BOOL pe_inv_arg(uint64_t inv, const void *bytes, size_t size, NSUInteger 
     if (!gRC.trojanMem) return NO;
     if (gRC.lastCallFailed) return NO; // void 方法：以 lastCallFailed 判定真实成败
     return YES;
+}
+
+// 热路径：setHidden:（BOOL 参数经 setArgument 传入，不走 withObject 包装）
+static BOOL pe_inv_hidden(uint64_t inv, bool hidden) {
+    if (!gRC || !gRC.trojanMem || !inv) return NO;
+    BOOL value = hidden; // BOOL = signed char（arm64 上 1 字节）
+    return pe_inv_arg(inv, &value, sizeof(value), 2) && pe_inv_invoke(inv);
 }
 
 // 热路径：投递到 SB 主线程执行——waitUntilDone:NO！
@@ -1303,18 +1318,24 @@ static bool pe_overlay_create(void) {
         }
         gDist[i] = dist;
 
-        // 持久化 invocation：每槽 5 个（box/name/dist 的 frame + 两个 text），
-        // retain 常驻——运行期只有 setArgument + 主线程 invoke，零对象生灭
+        // 持久化 invocation：每槽 8 个（box/name/dist 的 frame + text +
+        // setHidden:）——运行期只有 setArgument + 主线程 invoke，零对象生灭。
+        // setHidden: 必须走这里：performSelectorOnMainThread:withObject: 传
+        // 裸整数会被 Foundation 内部包装/释放（__NSSingleObjectArrayI 崩溃源）
         gBoxFrameInv[i]  = box ? pe_invocation_persist(box, pe_sel("setFrame:")) : 0;
         gNameFrameInv[i] = name ? pe_invocation_persist(name, pe_sel("setFrame:")) : 0;
         gNameTextInv[i]  = name ? pe_invocation_persist(name, pe_sel("setText:")) : 0;
         gDistFrameInv[i] = dist ? pe_invocation_persist(dist, pe_sel("setFrame:")) : 0;
         gDistTextInv[i]  = dist ? pe_invocation_persist(dist, pe_sel("setText:")) : 0;
+        gBoxHiddenInv[i]  = box ? pe_invocation_persist(box, pe_sel("setHidden:")) : 0;
+        gNameHiddenInv[i] = name ? pe_invocation_persist(name, pe_sel("setHidden:")) : 0;
+        gDistHiddenInv[i] = dist ? pe_invocation_persist(dist, pe_sel("setHidden:")) : 0;
     }
     int nInv = 0;
     for (int i = 0; i < PE_MAX_ENEMIES; i++) {
         nInv += (gBoxFrameInv[i] && gNameFrameInv[i] && gNameTextInv[i]
-                 && gDistFrameInv[i] && gDistTextInv[i]) ? 5 : 0;
+                 && gDistFrameInv[i] && gDistTextInv[i]
+                 && gBoxHiddenInv[i] && gNameHiddenInv[i] && gDistHiddenInv[i]) ? 8 : 0;
     }
     PE_LOG("持久化 invocation %d 个（运行期零对象创建/销毁）", nInv);
 
@@ -1352,7 +1373,8 @@ static void pe_box(int i, PE_Rect r, bool v) {
     PESlotState *st = &gBoxSt[i];
     if (!v) {
         if (st->shown) {
-            if (pe_perform_main(bx, pe_sel("setHidden:"), 1, NO)) st->shown = false;
+            // setHidden: 走持久化 invocation（withObject 裸整数是崩溃源，见上）
+            if (pe_inv_hidden(gBoxHiddenInv[i], true)) { st->shown = false; gRemoteFail = 0; }
             else gRemoteFail++;
         }
         return;
@@ -1372,7 +1394,7 @@ static void pe_box(int i, PE_Rect r, bool v) {
         }
     }
     if (!st->shown) {
-        if (pe_perform_main(bx, pe_sel("setHidden:"), 0, NO)) st->shown = true;
+        if (pe_inv_hidden(gBoxHiddenInv[i], false)) { st->shown = true; gRemoteFail = 0; }
         else gRemoteFail++;
     }
 }
@@ -1383,9 +1405,10 @@ static void pe_lbl(int i, uint64_t lb, const char *text, PE_Rect r, bool v) {
     PESlotState *st = isName ? &gNameSt[i] : &gDistSt[i];
     uint64_t frameInv = isName ? gNameFrameInv[i] : gDistFrameInv[i];
     uint64_t textInv = isName ? gNameTextInv[i] : gDistTextInv[i];
+    uint64_t hiddenInv = isName ? gNameHiddenInv[i] : gDistHiddenInv[i];
     if (!v || !text || !text[0]) {
         if (st->shown) {
-            if (pe_perform_main(lb, pe_sel("setHidden:"), 1, NO)) st->shown = false;
+            if (pe_inv_hidden(hiddenInv, true)) { st->shown = false; gRemoteFail = 0; }
             else gRemoteFail++;
         }
         return;
@@ -1416,7 +1439,7 @@ static void pe_lbl(int i, uint64_t lb, const char *text, PE_Rect r, bool v) {
         }
     }
     if (!st->shown) {
-        if (pe_perform_main(lb, pe_sel("setHidden:"), 0, NO)) st->shown = true;
+        if (pe_inv_hidden(hiddenInv, false)) { st->shown = true; gRemoteFail = 0; }
         else gRemoteFail++;
     }
 }
@@ -1563,6 +1586,9 @@ void PeaceESPStart(void) {
     memset(gNameTextInv, 0, sizeof(gNameTextInv));
     memset(gDistFrameInv, 0, sizeof(gDistFrameInv));
     memset(gDistTextInv, 0, sizeof(gDistTextInv));
+    memset(gBoxHiddenInv, 0, sizeof(gBoxHiddenInv));
+    memset(gNameHiddenInv, 0, sizeof(gNameHiddenInv));
+    memset(gDistHiddenInv, 0, sizeof(gDistHiddenInv));
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
