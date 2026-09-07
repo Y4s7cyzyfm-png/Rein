@@ -8,6 +8,7 @@
 #import "ReinBridge.h"
 #import "PeaceESP.h"
 #import "SilentKeepAlive.h"
+#import <os/log.h>
 #import <unistd.h>
 
 @implementation AppDelegate
@@ -36,7 +37,16 @@
     // 判据用 IsPlaying（实际播放中）而非 IsEnabled（偏好开关）：
     // ESP 运行期会自动开启静音保活（见 PeaceESP），即便用户偏好里关着，
     // 只要音频在播就说明 App 在后台持续运行、异常端口可应答，无需拆除。
-    if (SilentKeepAliveIsPlaying()) {
+    BOOL playing = SilentKeepAliveIsPlaying();
+    os_log_error(OS_LOG_DEFAULT,
+                 "[ReinBridge] backgrounding: keepalive playing=%d preference=%d espRunning=%d -> %{public}s",
+                 playing, SilentKeepAlivePreferenceEnabled(), PeaceESPIsRunning(),
+                 playing ? "keep session" : "teardown session");
+    ReinAppendConsoleLog([NSString stringWithFormat:
+        @"[ReinBridge] backgrounding: keepalive playing=%d preference=%d espRunning=%d -> %@",
+        playing, SilentKeepAlivePreferenceEnabled(), PeaceESPIsRunning(),
+        playing ? @"keep session" : @"teardown session"]);
+    if (playing) {
         return; // 保活中：会话保持，退到后台继续运行
     }
 
