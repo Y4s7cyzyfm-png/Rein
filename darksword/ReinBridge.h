@@ -65,6 +65,11 @@ OBJC_EXTERN BOOL ReinReadGameProcess(int * _Nullable outPid);
 /// ReinBridge 与 PeaceESP 的所有日志都会镜像到这里。
 OBJC_EXTERN void ReinAppendConsoleLog(NSString *line);
 
+/// rein.log 的文件描述符（未启用返回 -1）。给 PeaceESP 的崩溃黑匣子
+/// trace 用：直接 write()，绕开 os_log/NSString/fsync——注销连带杀掉
+/// 本进程时，页缓存里的 write 依然存活。
+OBJC_EXTERN int ReinLogFileFD(void);
+
 /// 当前缓存的日志行（旧→新），供「控制台日志」查看器显示。
 OBJC_EXTERN NSArray<NSString *> *ReinConsoleLogLines(void);
 

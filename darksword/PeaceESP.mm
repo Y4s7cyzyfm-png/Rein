@@ -105,6 +105,28 @@ static void pe_detail(NSString *detail) {
 }
 
 // ============================================================
+// 崩溃黑匣子（[PT] trace）：绘制热路径的每一步在「调用发出前」直接
+// write() 到 rein.log——不走 os_log / NSString / fsync（单次 ~µs 级，
+// 不改变热路径时序）。SB 注销时本进程被连带杀死，SIGKILL 不丢页缓存，
+// 文件里最后一行 [PT] = 崩死瞬间正在执行的远程调用（哪个槽、哪个操作、
+// setArgument 还是 performSelector 阶段）。2026-09-07 22:45 实锤：
+// 日志停在 tick2 绘制中途（绘制诊断#2/帧数据#3 缺失），无任何错误行——
+// 需要逐步级证据定位到底哪个调用打崩 SB。
+// ============================================================
+#define PE_TRACE(fmt, ...) \
+    do { \
+        char _pt[160]; \
+        int _pn = snprintf(_pt, sizeof(_pt), "[PT] " fmt "\n", ##__VA_ARGS__); \
+        if (_pn > 0) { \
+            int _fd = ReinLogFileFD(); \
+            if (_fd >= 0) { \
+                ssize_t _wr = write(_fd, _pt, (size_t)_pn); \
+                (void)_wr; \
+            } \
+        } \
+    } while (0)
+
+// ============================================================
 // 配置
 // ============================================================
 
@@ -433,8 +455,7 @@ static uint64_t pe_get_main(uint64_t target, const char *selectorName) {
 // 不建池不 drain：setup 期对象泄漏有界（~千个），换取运行期零 dealloc。
 
 static uint64_t gBoxFrameInv[PE_MAX_ENEMIES];
-static uint64_t gNameFrameInv[PE_MAX_ENEMIES], gNameTextInv[PE_MAX_ENEMIES];
-static uint64_t gDistFrameInv[PE_MAX_ENEMIES], gDistTextInv[PE_MAX_ENEMIES];
+static uint64_t gNameTextInv[PE_MAX_ENEMIES], gDistTextInv[PE_MAX_ENEMIES];
 // setHidden: 也走持久化 invocation：绝不能用 performSelectorOnMainThread:
 // withObject: 传裸整数（0/1）——Foundation 内部会用 __NSSingleObjectArrayI
 // 之类包装 withObject 参数：nil 可能抛 NSInvalidArgumentException，0x1 会在
@@ -443,6 +464,10 @@ static uint64_t gDistFrameInv[PE_MAX_ENEMIES], gDistTextInv[PE_MAX_ENEMIES];
 // 传 nil 给无参的 invoke 不受影响（参数被忽略，DSBridge 原版验证过）。
 static uint64_t gBoxHiddenInv[PE_MAX_ENEMIES];
 static uint64_t gNameHiddenInv[PE_MAX_ENEMIES], gDistHiddenInv[PE_MAX_ENEMIES];
+// 注意：name/dist label 是 box 的 subview（autoresizing 跟随 box 尺寸），
+// 帧循环只 setFrame box 一个视图——label 的 frame 持久化 invocation 已删除
+// （2026-09-07：tick 内 3 视图 × setFrame 是主要远程调用压力源，
+// 272 次/tick 降到 ~40 次/tick）。
 
 // 一次性创建并 retain 常驻 invocation（仅 overlay 创建期调用）。
 // 故意不建 autorelease pool：invocation/signature 泄漏（永不释放）正是目的。
@@ -1274,11 +1299,15 @@ static bool pe_overlay_create(void) {
     }
 
     for (int i = 0; i < PE_MAX_ENEMIES; i++) {
-        // 方框
+        // 方框（name/dist label 挂在 box 下面，随 box 尺寸 autoresize——
+        // 帧循环每敌人只需一次 setFrame，label 布局零远程调用）
         uint64_t box = remote_msg(gRC, viewClass, alloc, 0, 0, 0, 0);
         if (box) {
             pe_call_main_noarg(box, "init");
             pe_perform_main(box, pe_sel("setBackgroundColor:"), clearColor, YES);
+            // 初始 frame 先于 addSubview:label 设置——autoresizing 的
+            // margin/宽度增量以此为基准（box=(0,0,40,100)，label 相对布局）
+            pe_set_rect_main(box, "setFrame:", CGRectMake(0, 0, 40, 100));
             uint64_t layer = pe_get_main(box, "layer");
             if (layer) {
                 pe_set_double_main(layer, "setBorderWidth:", 2.0);
@@ -1286,12 +1315,11 @@ static bool pe_overlay_create(void) {
             }
             pe_set_double_main(box, "setAlpha:", 0.85); // 一次性设置，帧循环不再重复
             pe_set_u64_main(box, "setHidden:", 1);
-            pe_perform_main(window, pe_sel("addSubview:"), box, YES);
         }
         gBox[i] = box;
 
-        // 名称 label
-        uint64_t name = remote_msg(gRC, labelClass, alloc, 0, 0, 0, 0);
+        // 名称 label：box 上缘外（y=-18），宽度随 box 拉伸
+        uint64_t name = box ? remote_msg(gRC, labelClass, alloc, 0, 0, 0, 0) : 0;
         if (name) {
             pe_call_main_noarg(name, "init");
             pe_set_u64_main(name, "setTextAlignment:", 1);
@@ -1299,13 +1327,16 @@ static bool pe_overlay_create(void) {
             if (font) pe_perform_main(name, pe_sel("setFont:"), font, YES);
             pe_perform_main(name, pe_sel("setTextColor:"), whiteColor, YES);
             pe_perform_main(name, pe_sel("setBackgroundColor:"), clearColor, YES);
+            pe_set_rect_main(name, "setFrame:", CGRectMake(-10, -18, 60, 16));
+            // UIViewAutoresizingFlexibleWidth = 1<<1
+            pe_set_u64_main(name, "setAutoresizingMask:", 1 << 1);
             pe_set_u64_main(name, "setHidden:", 1);
-            pe_perform_main(window, pe_sel("addSubview:"), name, YES);
+            pe_perform_main(box, pe_sel("addSubview:"), name, YES);
         }
         gName[i] = name;
 
-        // 距离 label
-        uint64_t dist = remote_msg(gRC, labelClass, alloc, 0, 0, 0, 0);
+        // 距离 label：box 下缘外（y=102），顶边距随高度拉伸 + 宽度拉伸
+        uint64_t dist = box ? remote_msg(gRC, labelClass, alloc, 0, 0, 0, 0) : 0;
         if (dist) {
             pe_call_main_noarg(dist, "init");
             pe_set_u64_main(dist, "setTextAlignment:", 1);
@@ -1313,19 +1344,24 @@ static bool pe_overlay_create(void) {
             if (font) pe_perform_main(dist, pe_sel("setFont:"), font, YES);
             pe_perform_main(dist, pe_sel("setTextColor:"), whiteColor, YES);
             pe_perform_main(dist, pe_sel("setBackgroundColor:"), clearColor, YES);
+            pe_set_rect_main(dist, "setFrame:", CGRectMake(-10, 102, 60, 16));
+            // FlexibleTopMargin(1<<3) | FlexibleWidth(1<<1)：box 高度变化时
+            // label 的顶边距随之增长（钉在 box 下缘），宽度跟随
+            pe_set_u64_main(dist, "setAutoresizingMask:", (1 << 3) | (1 << 1));
             pe_set_u64_main(dist, "setHidden:", 1);
-            pe_perform_main(window, pe_sel("addSubview:"), dist, YES);
+            pe_perform_main(box, pe_sel("addSubview:"), dist, YES);
         }
         gDist[i] = dist;
 
-        // 持久化 invocation：每槽 8 个（box/name/dist 的 frame + text +
-        // setHidden:）——运行期只有 setArgument + 主线程 invoke，零对象生灭。
+        // label 都挂好后才把 box 挂到 window（一次挂整棵子树）
+        if (box) pe_perform_main(window, pe_sel("addSubview:"), box, YES);
+
+        // 持久化 invocation：每槽 6 个（box frame + name/dist 的 text +
+        // setHidden: ×3）——运行期只有 setArgument + 主线程 invoke，零对象生灭。
         // setHidden: 必须走这里：performSelectorOnMainThread:withObject: 传
         // 裸整数会被 Foundation 内部包装/释放（__NSSingleObjectArrayI 崩溃源）
         gBoxFrameInv[i]  = box ? pe_invocation_persist(box, pe_sel("setFrame:")) : 0;
-        gNameFrameInv[i] = name ? pe_invocation_persist(name, pe_sel("setFrame:")) : 0;
         gNameTextInv[i]  = name ? pe_invocation_persist(name, pe_sel("setText:")) : 0;
-        gDistFrameInv[i] = dist ? pe_invocation_persist(dist, pe_sel("setFrame:")) : 0;
         gDistTextInv[i]  = dist ? pe_invocation_persist(dist, pe_sel("setText:")) : 0;
         gBoxHiddenInv[i]  = box ? pe_invocation_persist(box, pe_sel("setHidden:")) : 0;
         gNameHiddenInv[i] = name ? pe_invocation_persist(name, pe_sel("setHidden:")) : 0;
@@ -1333,11 +1369,10 @@ static bool pe_overlay_create(void) {
     }
     int nInv = 0;
     for (int i = 0; i < PE_MAX_ENEMIES; i++) {
-        nInv += (gBoxFrameInv[i] && gNameFrameInv[i] && gNameTextInv[i]
-                 && gDistFrameInv[i] && gDistTextInv[i]
-                 && gBoxHiddenInv[i] && gNameHiddenInv[i] && gDistHiddenInv[i]) ? 8 : 0;
+        nInv += (gBoxFrameInv[i] && gNameTextInv[i] && gDistTextInv[i]
+                 && gBoxHiddenInv[i] && gNameHiddenInv[i] && gDistHiddenInv[i]) ? 6 : 0;
     }
-    PE_LOG("持久化 invocation %d 个（运行期零对象创建/销毁）", nInv);
+    PE_LOG("持久化 invocation %d 个（label 随 box autoresize，运行期零对象创建/销毁）", nInv);
 
     pe_set_u64_main(window, "setHidden:", 0);
     PE_LOG("overlay %dx%d %d slots", (int)gSW, (int)gSH, PE_MAX_ENEMIES);
@@ -1352,7 +1387,8 @@ static bool pe_overlay_create(void) {
 // 返回 trap」。一旦某调用超时/异常端口无人监听，trojan 线程跳回 0x401
 // 就是裸 SIGBUS → SpringBoard 注销（2026-09-07 真机实锤）。NSInvocation
 // 路径每次 ~10 个远程调用，60 槽 × 3 视图 × 30fps = 每秒数万次，必然失步。
-// 因此：稳态（无变化）零调用；矩形/文字/可见性变更才调用；文字再按帧节流。
+// 因此：稳态（无变化）零调用；frame 只走 box（label 是 subview 自动跟随）；
+// 文字 strcmp 状态缓存节流；可见性只在切换时调用。热路径逐步 [PT] trace。
 
 typedef struct {
     bool shown;
@@ -1374,73 +1410,79 @@ static void pe_box(int i, PE_Rect r, bool v) {
     if (!v) {
         if (st->shown) {
             // setHidden: 走持久化 invocation（withObject 裸整数是崩溃源，见上）
+            PE_TRACE("bx%d hide A", i);
             if (pe_inv_hidden(gBoxHiddenInv[i], true)) { st->shown = false; gRemoteFail = 0; }
-            else gRemoteFail++;
+            else { gRemoteFail++; PE_TRACE("bx%d hide FAIL fail=%ld", i, gRemoteFail); }
         }
         return;
     }
-    // 变更才 setFrame（>1px 抖动抑制）——走持久化 invocation：零对象创建
+    // 变更才 setFrame（>1px 抖动抑制）——走持久化 invocation：零对象创建。
+    // label 是 box 的 subview（autoresizing），一个 setFrame 全家跟随。
     bool moved = !st->shown ||
                  fabs(st->x - r.x) > 1 || fabs(st->y - r.y) > 1 ||
                  fabs(st->w - r.width) > 1 || fabs(st->h - r.height) > 1;
     if (moved && gBoxFrameInv[i]) {
         CGRect cr = CGRectMake(r.x, r.y, r.width, r.height);
-        if (pe_inv_arg(gBoxFrameInv[i], &cr, sizeof(cr), 2) &&
-            pe_inv_invoke(gBoxFrameInv[i])) {
-            st->x = r.x; st->y = r.y; st->w = r.width; st->h = r.height;
-            gRemoteFail = 0;
+        PE_TRACE("bx%d frame A %.0f,%.0f %.0fx%.0f", i, r.x, r.y, r.width, r.height);
+        if (pe_inv_arg(gBoxFrameInv[i], &cr, sizeof(cr), 2)) {
+            PE_TRACE("bx%d frame I", i);
+            if (pe_inv_invoke(gBoxFrameInv[i])) {
+                st->x = r.x; st->y = r.y; st->w = r.width; st->h = r.height;
+                gRemoteFail = 0;
+            } else {
+                gRemoteFail++; PE_TRACE("bx%d frame FAIL fail=%ld", i, gRemoteFail);
+            }
         } else {
-            gRemoteFail++;
+            gRemoteFail++; PE_TRACE("bx%d frame ARGFAIL fail=%ld", i, gRemoteFail);
         }
     }
     if (!st->shown) {
+        PE_TRACE("bx%d show A", i);
         if (pe_inv_hidden(gBoxHiddenInv[i], false)) { st->shown = true; gRemoteFail = 0; }
-        else gRemoteFail++;
+        else { gRemoteFail++; PE_TRACE("bx%d show FAIL fail=%ld", i, gRemoteFail); }
     }
 }
 
-static void pe_lbl(int i, uint64_t lb, const char *text, PE_Rect r, bool v) {
+// label 更新（name/dist）：只管文字与可见性——frame 由 box 的 autoresizing
+// 带动，本函数零 frame 调用。text 始终传当前值：strcmp 状态缓存天然节流
+// （旧 textTick 节流在非更新帧传 NULL，触发整场 label 隐藏/重显风暴——
+// 2026-09-07 22:45 崩溃时段 tick2 恰是 34 连发 setHidden:YES，实锤移除）
+static void pe_lbl(int i, uint64_t lb, const char *text, bool v) {
     if (!lb || i < 0 || i >= PE_MAX_ENEMIES) return;
     bool isName = (lb == gName[i]);
     PESlotState *st = isName ? &gNameSt[i] : &gDistSt[i];
-    uint64_t frameInv = isName ? gNameFrameInv[i] : gDistFrameInv[i];
     uint64_t textInv = isName ? gNameTextInv[i] : gDistTextInv[i];
     uint64_t hiddenInv = isName ? gNameHiddenInv[i] : gDistHiddenInv[i];
+    const char *tag = isName ? "nm" : "ds";
     if (!v || !text || !text[0]) {
         if (st->shown) {
+            PE_TRACE("%s%d hide A", tag, i);
             if (pe_inv_hidden(hiddenInv, true)) { st->shown = false; gRemoteFail = 0; }
-            else gRemoteFail++;
+            else { gRemoteFail++; PE_TRACE("%s%d hide FAIL fail=%ld", tag, i, gRemoteFail); }
         }
         return;
     }
-    bool textChanged = !st->shown || strcmp(st->text, text) != 0;
-    bool moved = !st->shown ||
-                 fabs(st->x - r.x) > 1 || fabs(st->y - r.y) > 1 ||
-                 fabs(st->w - r.width) > 1 || fabs(st->h - r.height) > 1;
-    if (!textChanged && !moved) return; // 稳态：零远程调用
-    if (textChanged && textInv) {
+    if (strcmp(st->text, text) != 0 && textInv) {
         uint64_t rns = pe_nsstring([NSString stringWithUTF8String:text]); // 缓存常驻
         if (rns) {
-            if (pe_inv_arg(textInv, &rns, sizeof(rns), 2) && pe_inv_invoke(textInv)) {
-                snprintf(st->text, sizeof(st->text), "%s", text);
-                gRemoteFail = 0;
+            PE_TRACE("%s%d text A %s", tag, i, text);
+            if (pe_inv_arg(textInv, &rns, sizeof(rns), 2)) {
+                PE_TRACE("%s%d text I", tag, i);
+                if (pe_inv_invoke(textInv)) {
+                    snprintf(st->text, sizeof(st->text), "%s", text);
+                    gRemoteFail = 0;
+                } else {
+                    gRemoteFail++; PE_TRACE("%s%d text FAIL fail=%ld", tag, i, gRemoteFail);
+                }
             } else {
-                gRemoteFail++;
+                gRemoteFail++; PE_TRACE("%s%d text ARGFAIL fail=%ld", tag, i, gRemoteFail);
             }
         }
     }
-    if (moved && frameInv) {
-        CGRect cr = CGRectMake(r.x, r.y, r.width, r.height);
-        if (pe_inv_arg(frameInv, &cr, sizeof(cr), 2) && pe_inv_invoke(frameInv)) {
-            st->x = r.x; st->y = r.y; st->w = r.width; st->h = r.height;
-            gRemoteFail = 0;
-        } else {
-            gRemoteFail++;
-        }
-    }
     if (!st->shown) {
+        PE_TRACE("%s%d show A", tag, i);
         if (pe_inv_hidden(hiddenInv, false)) { st->shown = true; gRemoteFail = 0; }
-        else gRemoteFail++;
+        else { gRemoteFail++; PE_TRACE("%s%d show FAIL fail=%ld", tag, i, gRemoteFail); }
     }
 }
 
@@ -1475,11 +1517,11 @@ static void peace_esp_tick(void) {
                cam.rot.x, cam.rot.y, cam.rot.z, cam.fov);
         sLoggedCount++;
     }
+    PE_TRACE("tick %llu enemies=%d", (unsigned long long)gFrames, n);
     int w2sVisible = 0;
     int onscreen = 0;
     int vi = 0;
     PE_Rect zeroRect = {0, 0, 0, 0};
-    bool textTick = (gFrames % 10) == 0; // 文字（名字/距离）每 10 帧才更新一次
     for (int i = 0; i < n && vi < PE_MAX_ENEMIES; i++) {
         PE_Enemy *e = &es[i];
         PE_Vec2S tp = w2s(e->top, &cam, gSW, gSH);
@@ -1496,26 +1538,30 @@ static void peace_esp_tick(void) {
 
         onscreen++;
 
+        // box 的 frame 即全家布局（label 是 subview，autoresizing 跟随）
         PE_Rect boxRect = {x, y, (double)w, (double)h};
         pe_box(vi, boxRect, true);
-        PE_Rect nameRect = {x - 10, y - 18, (double)w + 20, 16};
         char nb[24] = "Player";
         if (e->name.length > 0) {
             snprintf(nb, sizeof(nb), "%s", e->name.UTF8String ?: "Player");
         } else if (e->isAI) {
             snprintf(nb, sizeof(nb), "BOT");
         }
-        pe_lbl(vi, gName[vi], textTick ? nb : NULL, nameRect, true);
+        pe_lbl(vi, gName[vi], nb, true);
         char ds[24];
         snprintf(ds, sizeof(ds), "%.0fm", e->distance / 100.0f);
-        PE_Rect distRect = {x - 10, (double)y + h + 2, (double)w + 20, 16};
-        pe_lbl(vi, gDist[vi], textTick ? ds : NULL, distRect, true);
+        pe_lbl(vi, gDist[vi], ds, true);
         vi++;
+        // 节奏垫片：敌人之间垫 200µs，把 tick 内的远程调用从 ~10ms 连发
+        // 摊到整帧——给 SB 主线程留出处理已投递 invoke 的时间，把
+        // 「主线程还在 invoke 上一帧参数」与「trojan 线程 setArgument 下一帧」
+        // 的同 invocation 竞态窗口压到最小（17 敌人 ≈ 3.4ms，仍在 50ms 帧预算内）
+        usleep(200);
     }
     for (int i = vi; i < PE_MAX_ENEMIES; i++) {
         pe_box(i, zeroRect, false);
-        pe_lbl(i, gName[i], NULL, zeroRect, false);
-        pe_lbl(i, gDist[i], NULL, zeroRect, false);
+        pe_lbl(i, gName[i], NULL, false);
+        pe_lbl(i, gDist[i], NULL, false);
     }
     gVis = vi;
 
@@ -1581,10 +1627,10 @@ void PeaceESPStart(void) {
     gRemoteFail = 0;
     pe_slot_states_reset();
     gNSStringCache = nil; // 远程字符串缓存随会话重建（旧地址已失效）
+    gSelCache = nil;      // SEL/Class 缓存同理：respring 后地址理论上不变
+    gClassCache = nil;    // （dyld 共享缓存），但重查一次最稳，代价一次性
     memset(gBoxFrameInv, 0, sizeof(gBoxFrameInv));
-    memset(gNameFrameInv, 0, sizeof(gNameFrameInv));
     memset(gNameTextInv, 0, sizeof(gNameTextInv));
-    memset(gDistFrameInv, 0, sizeof(gDistFrameInv));
     memset(gDistTextInv, 0, sizeof(gDistTextInv));
     memset(gBoxHiddenInv, 0, sizeof(gBoxHiddenInv));
     memset(gNameHiddenInv, 0, sizeof(gNameHiddenInv));
@@ -1602,7 +1648,7 @@ void PeaceESPStart(void) {
                 return;
             }
 
-            PE_LOG("=== start (build 20260907-h, 4KB/16KB adaptive) ===（Console.app 过滤 subsystem: com.rein.peaceesp）");
+            PE_LOG("=== start (build 20260907-i, subview labels + PT trace) ===（Console.app 过滤 subsystem: com.rein.peaceesp）");
             if (!pe_init_game()) {
                 pe_fail(@"游戏初始化失败（vm_map / 基址扫描），详细日志见 Console.app（subsystem: com.rein.peaceesp）。");
                 return;

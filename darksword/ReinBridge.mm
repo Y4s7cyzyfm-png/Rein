@@ -138,6 +138,10 @@ NSArray<NSString *> *ReinConsoleLogLines(void) {
     }
 }
 
+int ReinLogFileFD(void) {
+    return rein_log_file_fd();
+}
+
 void ReinClearConsoleLog(void) {
     @synchronized (rein_console_lock()) {
         if (gConsoleLog) [gConsoleLog removeAllObjects];
