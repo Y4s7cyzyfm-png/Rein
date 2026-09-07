@@ -17,6 +17,7 @@
 #import <os/log.h>
 
 #include <atomic>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -51,6 +52,40 @@ static RemoteCall *g_springBoard = nil;
 static NSUInteger const kReinConsoleLogHardCap = 1500; // 环形缓冲上限
 static NSMutableArray<NSString *> *gConsoleLog = nil;
 
+// ---------------------------------------------------------------------------
+// 持久化日志文件（Documents/rein.log）：App 被注销连带杀掉/闪退时来不及
+// 复制控制台——文件里什么都在。与 darksword.log 同款做法：每行
+// write+fsync，进程猝死前最后一条日志也必然落盘。沙盒文件可通过
+// 「文件」App → 我的 iPhone → Rein 查看，或 Xcode/idevice 工具导出。
+// ---------------------------------------------------------------------------
+static int rein_log_file_fd(void) {
+    static int fd = -2;
+    if (fd != -2) return fd;
+
+    fd = -1;
+    @autoreleasepool {
+        NSArray<NSString *> *dirs =
+            NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        NSString *docs = dirs.firstObject;
+        if (docs.length == 0) return fd;
+
+        NSString *path = [docs stringByAppendingPathComponent:@"rein.log"];
+        // 保留最近 ~4MB：防止长会话无限膨胀（重命名旧的，下次启动自然丢弃）
+        NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+        if ([attrs.fileSize unsignedLongLongValue] > 4 * 1024 * 1024) {
+            NSString *old = [docs stringByAppendingPathComponent:@"rein.log.1"];
+            [[NSFileManager defaultManager] removeItemAtPath:old error:nil];
+            [[NSFileManager defaultManager] moveItemAtPath:path toPath:old error:nil];
+        }
+        fd = open(path.fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            const char *boot = "==== rein.log session ====\n";
+            write(fd, boot, (size_t)strlen(boot));
+        }
+    }
+    return fd;
+}
+
 static NSObject *rein_console_lock(void) {
     static NSObject *lock;
     static dispatch_once_t onceToken;
@@ -71,13 +106,28 @@ static NSDateFormatter *rein_console_date_formatter(void) {
 
 void ReinAppendConsoleLog(NSString *line) {
     if (line.length == 0) return;
+    NSString *stamped = [NSString stringWithFormat:@"%@  %@",
+        [rein_console_date_formatter() stringFromDate:[NSDate date]], line];
     @synchronized (rein_console_lock()) {
         if (!gConsoleLog) gConsoleLog = [NSMutableArray array];
-        [gConsoleLog addObject:[NSString stringWithFormat:@"%@  %@",
-            [rein_console_date_formatter() stringFromDate:[NSDate date]], line]];
+        [gConsoleLog addObject:stamped];
         if (gConsoleLog.count > kReinConsoleLogHardCap) {
             [gConsoleLog removeObjectsInRange:
                 NSMakeRange(0, gConsoleLog.count - kReinConsoleLogHardCap)];
+        }
+    }
+    // 镜像到持久化文件：write+fsync 保证进程猝死（注销连带杀死/闪退）前
+    // 的最后一行也已落盘。文件 IO 走 fd 直写，不依赖 App 存活。
+    int fd = rein_log_file_fd();
+    if (fd >= 0) {
+        const char *utf8 = stamped.UTF8String;
+        if (utf8) {
+            ssize_t len = (ssize_t)strlen(utf8);
+            if (len > 0) {
+                write(fd, utf8, (size_t)len);
+                write(fd, "\n", 1);
+                fsync(fd);
+            }
         }
     }
 }
