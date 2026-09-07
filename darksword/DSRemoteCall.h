@@ -9,6 +9,7 @@
 
 @interface RemoteCall : NSObject
 @property(nonatomic, strong) NSString *lastError;
+@property(nonatomic) BOOL lastCallFailed; // 上一次 doRemoteCall* 是否失败（void 方法无法用返回值判定）
 @property(nonatomic) uint64_t trojanMem;
 @property(nonatomic) BOOL trojanMemIsStackFallback;
 @property(nonatomic) uint64_t trojanMemScratchOffset;

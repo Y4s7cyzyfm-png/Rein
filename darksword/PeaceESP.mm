@@ -345,7 +345,12 @@ static BOOL pe_perform_main(uint64_t target, uint64_t selector,
     uint64_t perform = pe_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
     if (!perform) return NO;
     remote_msg(gRC, target, perform, selector, argument, wait ? 1 : 0, 0);
-    return gRC.trojanMem != 0;
+    // 只查 trojanMem 不够：performSelectorOnMainThread 返回 void（x0 是垃圾），
+    // remote_msg 内部失败（mid-flight 重停泊/超时）时 trojanMem 仍非 0——
+    // 用 lastCallFailed 判定真实成败（否则失败计数永不生效，熔断形同虚设）
+    if (!gRC.trojanMem) return NO;
+    if (gRC.lastCallFailed) return NO;
+    return YES;
 }
 
 // 在调用线程组 NSInvocation，再同步投递到 SpringBoard 真实主线程执行
@@ -362,19 +367,19 @@ static BOOL pe_invoke_main_result(uint64_t target, uint64_t selector,
     uint64_t signature = remote_msg(gRC, target,
                                     pe_sel("methodSignatureForSelector:"),
                                     selector, 0, 0, 0);
-    if (!gRC.trojanMem) return NO;
+    if (!gRC.trojanMem || gRC.lastCallFailed) return NO;
     uint64_t invocationClass = pe_class("NSInvocation");
     uint64_t invocation = signature && invocationClass
         ? remote_msg(gRC, invocationClass,
                      pe_sel("invocationWithMethodSignature:"),
                      signature, 0, 0, 0)
         : 0;
-    if (!invocation || !gRC.trojanMem) return NO;
+    if (!invocation || !gRC.trojanMem || gRC.lastCallFailed) return NO;
 
     remote_msg(gRC, invocation, pe_sel("setTarget:"), target, 0, 0, 0);
-    if (!gRC.trojanMem) return NO;
+    if (!gRC.trojanMem || gRC.lastCallFailed) return NO;
     remote_msg(gRC, invocation, pe_sel("setSelector:"), selector, 0, 0, 0);
-    if (!gRC.trojanMem) return NO;
+    if (!gRC.trojanMem || gRC.lastCallFailed) return NO;
 
     uint64_t scratch = gRC.trojanMem + 0x800;
     for (NSUInteger index = 0; index < argumentCount; index++) {
@@ -387,19 +392,19 @@ static BOOL pe_invoke_main_result(uint64_t target, uint64_t selector,
         }
         remote_msg(gRC, invocation, pe_sel("setArgument:atIndex:"),
                    scratch, index + 2, 0, 0);
-        if (!gRC.trojanMem) { gRemoteFail++; return NO; }
+        if (!gRC.trojanMem || gRC.lastCallFailed) { gRemoteFail++; return NO; }
         scratch += (arguments[index].size + 15) & ~15ULL;
     }
 
     pe_perform_main(invocation, pe_sel("invoke"), 0, YES);
-    if (!gRC.trojanMem) { gRemoteFail++; return NO; }
+    if (!gRC.trojanMem || gRC.lastCallFailed) { gRemoteFail++; return NO; }
     if (result && resultSize > 0) {
         uint64_t resultScratch = gRC.trojanMem + 0xC00;
         memset(result, 0, resultSize);
         if (![gRC remote_write:resultScratch from:result size:(uint64_t)resultSize]) { gRemoteFail++; return NO; }
         remote_msg(gRC, invocation, pe_sel("getReturnValue:"),
                    resultScratch, 0, 0, 0);
-        if (!gRC.trojanMem) { gRemoteFail++; return NO; }
+        if (!gRC.trojanMem || gRC.lastCallFailed) { gRemoteFail++; return NO; }
         if (![gRC remoteRead:resultScratch to:result size:(uint64_t)resultSize]) { gRemoteFail++; return NO; }
     }
     gRemoteFail = 0; // 成功：清零连续失败计数
@@ -458,7 +463,9 @@ static BOOL pe_inv_arg(uint64_t inv, const void *bytes, size_t size, NSUInteger 
     uint64_t scratch = gRC.trojanMem + 0x800;
     if (![gRC remote_write:scratch from:bytes size:(uint64_t)size]) return NO;
     remote_msg(gRC, inv, pe_sel("setArgument:atIndex:"), scratch, index, 0, 0);
-    return gRC.trojanMem != 0;
+    if (!gRC.trojanMem) return NO;
+    if (gRC.lastCallFailed) return NO; // void 方法：以 lastCallFailed 判定真实成败
+    return YES;
 }
 
 // 热路径：投递到 SB 主线程执行——waitUntilDone:NO！
