@@ -1085,16 +1085,31 @@ static bool pe_vp(PECamera *cam) {
     return true;
 }
 
-// 玩家名字（0xAF8，FString：指针 → UTF-16 缓冲）
+// 玩家名字（0xAF8，FString/TArray<TCHAR>：{Data 指针, ArrayNum, ArrayMax}）
+// 2026-09-07 真机实锤：只验 Data 指针会读出垃圾（"initWithUTF8String:"、
+// 时间戳——O_NAME 对非玩家 Actor 不是名字字段）。加 FString 头校验：
+// num/max 必须是合理的数组计数，才认定这里是真 FString。
 static NSString *pe_actor_name(uint64_t a) {
     uint64_t fstr = kread64(a + O_NAME);
     if (fstr < 0x100000000ULL || fstr >= 0x800000000ULL) return nil;
-    uint16_t buf[24];
-    if (!kreadbuf(fstr, buf, sizeof(buf))) return nil;
-    int len = 0;
-    while (len < 24 && buf[len] != 0) len++;
-    if (len == 0 || len >= 24) return nil; // 空串或未终止（可疑）
+    // FString 头：+0x08 ArrayNum、+0x10 ArrayMax（TArray 布局）
+    uint32_t num = kread32(a + O_NAME + 8);
+    uint32_t max = kread32(a + O_NAME + 16);
+    if (num == 0 || num > 32 || max < num || max > 4096) return nil; // 不是 FString
+    int len = (int)num - 1; // 含结尾 NUL
+    if (len <= 0) return nil;
     if (len > 16) len = 16; // 显示上限
+    uint16_t buf[17];
+    if (!kreadbuf(fstr, buf, (size_t)len * 2)) return nil;
+    // 可打印性校验：ASCII 可见 / 常用 CJK 区间，滤掉随机字节
+    for (int i = 0; i < len; i++) {
+        uint16_t c = buf[i];
+        BOOL ok = (c >= 0x20 && c <= 0x7E) ||   // ASCII 可见
+                  (c >= 0x4E00 && c <= 0x9FFF) || // CJK
+                  (c >= 0x3000 && c <= 0x303F) || // CJK 标点
+                  (c >= 0xFF00 && c <= 0xFFEF);   // 全角
+        if (!ok) return nil;
+    }
     return [[NSString alloc] initWithBytes:buf length:(NSUInteger)len * 2
                                   encoding:NSUTF16LittleEndianStringEncoding];
 }
@@ -1534,6 +1549,14 @@ static void peace_esp_tick(void) {
         if (!tp.visible || !bt.visible) continue;
 
         float h = (float)fabs(bt.y - tp.y), w = h * 0.4f, x = tp.x - w * 0.5f, y = tp.y;
+        // 钳制：<3m 的敌人投影爆炸（2m 实测 614x1536 巨框，无意义且给
+        // SB 主线程 autoresizing 添乱）；框高也不超过 1.2 倍屏高
+        if (e->distance < 300.0f) continue;
+        if (h > (float)gSH * 1.2f) {
+            h = (float)gSH * 1.2f;
+            w = h * 0.4f;
+            x = tp.x - w * 0.5f;
+        }
         if (x + w < 0 || x > gSW || y + h < 0 || y > gSH) continue;
 
         onscreen++;
@@ -1648,7 +1671,7 @@ void PeaceESPStart(void) {
                 return;
             }
 
-            PE_LOG("=== start (build 20260907-j, PAC sign cache + raw guard) ===（Console.app 过滤 subsystem: com.rein.peaceesp）");
+            PE_LOG("=== start (build 20260907-k, exc-port probe) ===（Console.app 过滤 subsystem: com.rein.peaceesp）");
             if (!pe_init_game()) {
                 pe_fail(@"游戏初始化失败（vm_map / 基址扫描），详细日志见 Console.app（subsystem: com.rein.peaceesp）。");
                 return;
