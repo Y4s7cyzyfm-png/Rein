@@ -33,7 +33,10 @@
 //   SpringBoard 打崩（即“注销”）。因此在系统给的存活窗口内把会话安全拆掉：
 //   先停 ESP（Overlay 会从 SpringBoard 移除），再销毁远程线程与异常端口。
 - (void)applicationDidEnterBackground:(UIApplication *)application {
-    if (SilentKeepAliveIsEnabled()) {
+    // 判据用 IsPlaying（实际播放中）而非 IsEnabled（偏好开关）：
+    // ESP 运行期会自动开启静音保活（见 PeaceESP），即便用户偏好里关着，
+    // 只要音频在播就说明 App 在后台持续运行、异常端口可应答，无需拆除。
+    if (SilentKeepAliveIsPlaying()) {
         return; // 保活中：会话保持，退到后台继续运行
     }
 

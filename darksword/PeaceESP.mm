@@ -10,6 +10,7 @@
 #import "PeaceESP.h"
 #import "ReinBridge.h"
 #import "DSRemoteCall.h"
+#import "SilentKeepAlive.h"
 
 #import <UIKit/UIKit.h>
 #import <os/log.h>
@@ -1532,6 +1533,7 @@ static void peace_esp_tick(void) {
 
 static NSString *gLastError = @"";
 static volatile bool gThreadDone = true;
+static BOOL gKeepAliveWasPlaying = NO; // ESP 启动前保活是否已在播（停止时恢复原状）
 
 static void pe_fail(NSString *message) {
     NSString *full = gLastErrorDetail.length > 0
@@ -1585,6 +1587,19 @@ void PeaceESPStart(void) {
                 return;
             }
 
+            // 后台保活：ESP 运行期自动开启静音音频——App 退后台不被冻结/回收，
+            // 会话与 ESP 得以在游戏内持续工作（AppDelegate 检测到音频在播即
+            // 跳过退后台自动拆除）。停止 ESP 时恢复原状（偏好开启的用户除外，
+            // 偏好开启 = 用户本就想要保活，即使此刻恰好没在播）。
+            gKeepAliveWasPlaying = SilentKeepAliveIsPlaying() || SilentKeepAlivePreferenceEnabled();
+            if (!gKeepAliveWasPlaying) {
+                if (SilentKeepAliveStart()) {
+                    PE_LOG("后台保活（静音音频）已随 ESP 开启");
+                } else {
+                    PE_LOG_ERROR("后台保活开启失败——退后台将会话拆除以防 SpringBoard 崩溃");
+                }
+            }
+
             gRun = true;
             gThreadDone = false;
             PE_LOG("running");
@@ -1603,6 +1618,11 @@ void PeaceESPStart(void) {
             pe_overlay_destroy();
             pe_page_cache_flush();
             gGameVMMap = 0;
+            // 恢复保活原状：ESP 启动前没在播就停掉（偏好开启的用户不受影响）
+            if (!gKeepAliveWasPlaying && SilentKeepAliveIsPlaying()) {
+                SilentKeepAliveStop();
+                PE_LOG("后台保活已随 ESP 停止");
+            }
             gRun = false;
             gThreadDone = true;
             PE_LOG("loop exit");
