@@ -355,74 +355,55 @@ static BOOL pe_invoke_main_result(uint64_t target, uint64_t selector,
                                   void *result, NSUInteger resultSize) {
     if (!gRC || !target || !selector || !gRC.trojanMem) return NO;
 
-    uint64_t poolClass = pe_class("NSAutoreleasePool");
-    uint64_t allocSelector = pe_sel("alloc");
-    uint64_t initSelector = pe_sel("init");
-    uint64_t drainSelector = pe_sel("drain");
-    uint64_t autoreleasePool = poolClass && allocSelector && initSelector && drainSelector
-        ? remote_msg(gRC,
-                     remote_msg(gRC, poolClass, allocSelector, 0, 0, 0, 0),
-                     initSelector, 0, 0, 0, 0)
+    // 不建 NSAutoreleasePool：drain 的释放风暴跑在 trojan 线程上，
+    // 是 0x401 未捕获崩溃的实锤路径（三份真机崩溃报告 x16=
+    // objc_removeAssociatedObjects）。autoreleased 的 signature/
+    // invocation 无池即泄漏——有界，且永不 dealloc 正是我们要的。
+    uint64_t signature = remote_msg(gRC, target,
+                                    pe_sel("methodSignatureForSelector:"),
+                                    selector, 0, 0, 0);
+    if (!gRC.trojanMem) return NO;
+    uint64_t invocationClass = pe_class("NSInvocation");
+    uint64_t invocation = signature && invocationClass
+        ? remote_msg(gRC, invocationClass,
+                     pe_sel("invocationWithMethodSignature:"),
+                     signature, 0, 0, 0)
         : 0;
-    if (!autoreleasePool) return NO;
+    if (!invocation || !gRC.trojanMem) return NO;
 
-    __block BOOL bodyOK = NO;
-    @try {
-        uint64_t signature = remote_msg(gRC, target,
-                                        pe_sel("methodSignatureForSelector:"),
-                                        selector, 0, 0, 0);
-        if (!gRC.trojanMem) return NO;
-        uint64_t invocationClass = pe_class("NSInvocation");
-        uint64_t invocation = signature && invocationClass
-            ? remote_msg(gRC, invocationClass,
-                         pe_sel("invocationWithMethodSignature:"),
-                         signature, 0, 0, 0)
-            : 0;
-        if (!invocation || !gRC.trojanMem) return NO;
+    remote_msg(gRC, invocation, pe_sel("setTarget:"), target, 0, 0, 0);
+    if (!gRC.trojanMem) return NO;
+    remote_msg(gRC, invocation, pe_sel("setSelector:"), selector, 0, 0, 0);
+    if (!gRC.trojanMem) return NO;
 
-        remote_msg(gRC, invocation, pe_sel("setTarget:"), target, 0, 0, 0);
-        if (!gRC.trojanMem) return NO;
-        remote_msg(gRC, invocation, pe_sel("setSelector:"), selector, 0, 0, 0);
-        if (!gRC.trojanMem) return NO;
-
-        uint64_t scratch = gRC.trojanMem + 0x800;
-        for (NSUInteger index = 0; index < argumentCount; index++) {
-            if (!arguments[index].bytes || arguments[index].size == 0 ||
-                ![gRC remote_write:scratch
-                              from:arguments[index].bytes
-                              size:(uint64_t)arguments[index].size]) {
-                return NO;
-            }
-            remote_msg(gRC, invocation, pe_sel("setArgument:atIndex:"),
-                       scratch, index + 2, 0, 0);
-            if (!gRC.trojanMem) return NO;
-            scratch += (arguments[index].size + 15) & ~15ULL;
+    uint64_t scratch = gRC.trojanMem + 0x800;
+    for (NSUInteger index = 0; index < argumentCount; index++) {
+        if (!arguments[index].bytes || arguments[index].size == 0 ||
+            ![gRC remote_write:scratch
+                          from:arguments[index].bytes
+                          size:(uint64_t)arguments[index].size]) {
+            gRemoteFail++;
+            return NO;
         }
-
-        pe_perform_main(invocation, pe_sel("invoke"), 0, YES);
-        if (!gRC.trojanMem) return NO;
-        if (result && resultSize > 0) {
-            uint64_t resultScratch = gRC.trojanMem + 0xC00;
-            memset(result, 0, resultSize);
-            if (![gRC remote_write:resultScratch from:result size:(uint64_t)resultSize]) return NO;
-            remote_msg(gRC, invocation, pe_sel("getReturnValue:"),
-                       resultScratch, 0, 0, 0);
-            if (!gRC.trojanMem) return NO;
-            if (![gRC remoteRead:resultScratch to:result size:(uint64_t)resultSize]) return NO;
-        }
-        bodyOK = YES;
-        gRemoteFail = 0; // 成功：清零连续失败计数
-        return YES;
-    } @finally {
-        // 只在主体成功时 drain——失败路径上 RemoteCall 可能已失步，
-        // 再发 drain 只会让 trojan 线程多一次裸跳 0x401 的机会
-        if (bodyOK && gRC.trojanMem) {
-            remote_msg(gRC, autoreleasePool, drainSelector, 0, 0, 0, 0);
-        }
+        remote_msg(gRC, invocation, pe_sel("setArgument:atIndex:"),
+                   scratch, index + 2, 0, 0);
+        if (!gRC.trojanMem) { gRemoteFail++; return NO; }
+        scratch += (arguments[index].size + 15) & ~15ULL;
     }
-    // 失败路径统一计账（@finally 不可 return，这里补记）：
-    // 连续失败 ≥3 立即熔断——失步后的任何调用都可能崩掉 SpringBoard
-    gRemoteFail++;
+
+    pe_perform_main(invocation, pe_sel("invoke"), 0, YES);
+    if (!gRC.trojanMem) { gRemoteFail++; return NO; }
+    if (result && resultSize > 0) {
+        uint64_t resultScratch = gRC.trojanMem + 0xC00;
+        memset(result, 0, resultSize);
+        if (![gRC remote_write:resultScratch from:result size:(uint64_t)resultSize]) { gRemoteFail++; return NO; }
+        remote_msg(gRC, invocation, pe_sel("getReturnValue:"),
+                   resultScratch, 0, 0, 0);
+        if (!gRC.trojanMem) { gRemoteFail++; return NO; }
+        if (![gRC remoteRead:resultScratch to:result size:(uint64_t)resultSize]) { gRemoteFail++; return NO; }
+    }
+    gRemoteFail = 0; // 成功：清零连续失败计数
+    return YES;
 }
 
 static BOOL pe_call_main_noarg(uint64_t target, const char *selectorName) {
@@ -433,6 +414,56 @@ static uint64_t pe_get_main(uint64_t target, const char *selectorName) {
     uint64_t result = 0;
     pe_invoke_main_result(target, pe_sel(selectorName), NULL, 0, &result, sizeof(result));
     return (result && gRC.trojanMem) ? result : 0;
+}
+
+// ============================================================
+// 持久化 NSInvocation（运行期零对象创建/销毁——SB 崩溃根治）
+// ============================================================
+// 三份崩溃报告实锤：PC=0x401 未捕获 trap，x16=objc_removeAssociatedObjects。
+// 旧路径每调用创建 NSAutoreleasePool+NSMethodSignature+NSInvocation，
+// drain 时释放风暴跑在 trojan 线程上，一旦超时失步，返回 trap 无人接管。
+// 方案：每个「槽 × 操作」在 overlay 创建时生成一次 invocation 并 retain
+// 常驻；运行期仅 setArgument:（内部 memcpy，无分配）+ 主线程 invoke。
+// 不建池不 drain：setup 期对象泄漏有界（~千个），换取运行期零 dealloc。
+
+static uint64_t gBoxFrameInv[PE_MAX_ENEMIES];
+static uint64_t gNameFrameInv[PE_MAX_ENEMIES], gNameTextInv[PE_MAX_ENEMIES];
+static uint64_t gDistFrameInv[PE_MAX_ENEMIES], gDistTextInv[PE_MAX_ENEMIES];
+
+// 一次性创建并 retain 常驻 invocation（仅 overlay 创建期调用）。
+// 故意不建 autorelease pool：invocation/signature 泄漏（永不释放）正是目的。
+static uint64_t pe_invocation_persist(uint64_t target, uint64_t selector) {
+    if (!gRC || !gRC.trojanMem || !target || !selector) return 0;
+    uint64_t signature = remote_msg(gRC, target,
+                                    pe_sel("methodSignatureForSelector:"),
+                                    selector, 0, 0, 0);
+    if (!gRC.trojanMem || !signature) return 0;
+    uint64_t invClass = pe_class("NSInvocation");
+    uint64_t inv = invClass
+        ? remote_msg(gRC, invClass, pe_sel("invocationWithMethodSignature:"),
+                     signature, 0, 0, 0)
+        : 0;
+    if (!gRC.trojanMem || !inv) return 0;
+    remote_msg(gRC, inv, pe_sel("setTarget:"), target, 0, 0, 0);
+    if (!gRC.trojanMem) return 0;
+    remote_msg(gRC, inv, pe_sel("setSelector:"), selector, 0, 0, 0);
+    if (!gRC.trojanMem) return 0;
+    remote_msg(gRC, inv, pe_sel("retain"), 0, 0, 0, 0); // 常驻，永不释放
+    return gRC.trojanMem ? inv : 0;
+}
+
+// 热路径：写参数（memcpy 语义）→ 返回是否成功
+static BOOL pe_inv_arg(uint64_t inv, const void *bytes, size_t size, NSUInteger index) {
+    if (!gRC || !gRC.trojanMem || !inv) return NO;
+    uint64_t scratch = gRC.trojanMem + 0x800;
+    if (![gRC remote_write:scratch from:bytes size:(uint64_t)size]) return NO;
+    remote_msg(gRC, inv, pe_sel("setArgument:atIndex:"), scratch, index, 0, 0);
+    return gRC.trojanMem != 0;
+}
+
+// 热路径：投递到 SB 主线程执行（同旧 invoke 步骤，单次 remote_msg）
+static BOOL pe_inv_invoke(uint64_t inv) {
+    return pe_perform_main(inv, pe_sel("invoke"), 0, YES);
 }
 
 // 工厂方法结果立即 retain，跨 performSelector 轮次保活（DSBridge 经验）
@@ -1257,7 +1288,21 @@ static bool pe_overlay_create(void) {
             pe_perform_main(window, pe_sel("addSubview:"), dist, YES);
         }
         gDist[i] = dist;
+
+        // 持久化 invocation：每槽 5 个（box/name/dist 的 frame + 两个 text），
+        // retain 常驻——运行期只有 setArgument + 主线程 invoke，零对象生灭
+        gBoxFrameInv[i]  = box ? pe_invocation_persist(box, pe_sel("setFrame:")) : 0;
+        gNameFrameInv[i] = name ? pe_invocation_persist(name, pe_sel("setFrame:")) : 0;
+        gNameTextInv[i]  = name ? pe_invocation_persist(name, pe_sel("setText:")) : 0;
+        gDistFrameInv[i] = dist ? pe_invocation_persist(dist, pe_sel("setFrame:")) : 0;
+        gDistTextInv[i]  = dist ? pe_invocation_persist(dist, pe_sel("setText:")) : 0;
     }
+    int nInv = 0;
+    for (int i = 0; i < PE_MAX_ENEMIES; i++) {
+        nInv += (gBoxFrameInv[i] && gNameFrameInv[i] && gNameTextInv[i]
+                 && gDistFrameInv[i] && gDistTextInv[i]) ? 5 : 0;
+    }
+    PE_LOG("持久化 invocation %d 个（运行期零对象创建/销毁）", nInv);
 
     pe_set_u64_main(window, "setHidden:", 0);
     PE_LOG("overlay %dx%d %d slots", (int)gSW, (int)gSH, PE_MAX_ENEMIES);
@@ -1293,54 +1338,72 @@ static void pe_box(int i, PE_Rect r, bool v) {
     PESlotState *st = &gBoxSt[i];
     if (!v) {
         if (st->shown) {
-            if (pe_set_u64_main(bx, "setHidden:", 1)) st->shown = false;
+            if (pe_perform_main(bx, pe_sel("setHidden:"), 1, YES)) st->shown = false;
+            else gRemoteFail++;
         }
         return;
     }
-    // 变更才 setFrame（>1px 抖动抑制）；显示状态切换才 setHidden
+    // 变更才 setFrame（>1px 抖动抑制）——走持久化 invocation：零对象创建
     bool moved = !st->shown ||
                  fabs(st->x - r.x) > 1 || fabs(st->y - r.y) > 1 ||
                  fabs(st->w - r.width) > 1 || fabs(st->h - r.height) > 1;
-    if (moved) {
-        if (pe_set_rect_main(bx, "setFrame:", CGRectMake(r.x, r.y, r.width, r.height))) {
+    if (moved && gBoxFrameInv[i]) {
+        CGRect cr = CGRectMake(r.x, r.y, r.width, r.height);
+        if (pe_inv_arg(gBoxFrameInv[i], &cr, sizeof(cr), 2) &&
+            pe_inv_invoke(gBoxFrameInv[i])) {
             st->x = r.x; st->y = r.y; st->w = r.width; st->h = r.height;
+            gRemoteFail = 0;
+        } else {
+            gRemoteFail++;
         }
     }
     if (!st->shown) {
-        if (pe_set_u64_main(bx, "setHidden:", 0)) st->shown = true;
+        if (pe_perform_main(bx, pe_sel("setHidden:"), 0, YES)) st->shown = true;
+        else gRemoteFail++;
     }
 }
 
 static void pe_lbl(int i, uint64_t lb, const char *text, PE_Rect r, bool v) {
-    if (!lb) return;
-    PESlotState *st = (i >= 0 && i < PE_MAX_ENEMIES)
-        ? ((lb == gName[i]) ? &gNameSt[i] : &gDistSt[i]) : NULL;
+    if (!lb || i < 0 || i >= PE_MAX_ENEMIES) return;
+    bool isName = (lb == gName[i]);
+    PESlotState *st = isName ? &gNameSt[i] : &gDistSt[i];
+    uint64_t frameInv = isName ? gNameFrameInv[i] : gDistFrameInv[i];
+    uint64_t textInv = isName ? gNameTextInv[i] : gDistTextInv[i];
     if (!v || !text || !text[0]) {
-        if (st && st->shown) {
-            if (pe_set_u64_main(lb, "setHidden:", 1)) st->shown = false;
+        if (st->shown) {
+            if (pe_perform_main(lb, pe_sel("setHidden:"), 1, YES)) st->shown = false;
+            else gRemoteFail++;
         }
         return;
     }
-    bool textChanged = !st || !st->shown || strcmp(st->text, text) != 0;
-    bool moved = !st || !st->shown ||
+    bool textChanged = !st->shown || strcmp(st->text, text) != 0;
+    bool moved = !st->shown ||
                  fabs(st->x - r.x) > 1 || fabs(st->y - r.y) > 1 ||
                  fabs(st->w - r.width) > 1 || fabs(st->h - r.height) > 1;
     if (!textChanged && !moved) return; // 稳态：零远程调用
-    if (textChanged) {
-        NSString *ns = [NSString stringWithUTF8String:text];
-        uint64_t rns = pe_nsstring(ns); // 缓存复用 + 常驻（不在远端 release，防 dealloc 崩 SB）
+    if (textChanged && textInv) {
+        uint64_t rns = pe_nsstring([NSString stringWithUTF8String:text]); // 缓存常驻
         if (rns) {
-            BOOL ok = pe_perform_main(lb, pe_sel("setText:"), rns, YES);
-            if (ok && st) snprintf(st->text, sizeof(st->text), "%s", text);
+            if (pe_inv_arg(textInv, &rns, sizeof(rns), 2) && pe_inv_invoke(textInv)) {
+                snprintf(st->text, sizeof(st->text), "%s", text);
+                gRemoteFail = 0;
+            } else {
+                gRemoteFail++;
+            }
         }
     }
-    if (moved) {
-        if (pe_set_rect_main(lb, "setFrame:", CGRectMake(r.x, r.y, r.width, r.height))) {
-            if (st) { st->x = r.x; st->y = r.y; st->w = r.width; st->h = r.height; }
+    if (moved && frameInv) {
+        CGRect cr = CGRectMake(r.x, r.y, r.width, r.height);
+        if (pe_inv_arg(frameInv, &cr, sizeof(cr), 2) && pe_inv_invoke(frameInv)) {
+            st->x = r.x; st->y = r.y; st->w = r.width; st->h = r.height;
+            gRemoteFail = 0;
+        } else {
+            gRemoteFail++;
         }
     }
-    if (st && !st->shown) {
-        if (pe_set_u64_main(lb, "setHidden:", 0)) st->shown = true;
+    if (!st->shown) {
+        if (pe_perform_main(lb, pe_sel("setHidden:"), 0, YES)) st->shown = true;
+        else gRemoteFail++;
     }
 }
 
@@ -1480,6 +1543,11 @@ void PeaceESPStart(void) {
     gRemoteFail = 0;
     pe_slot_states_reset();
     gNSStringCache = nil; // 远程字符串缓存随会话重建（旧地址已失效）
+    memset(gBoxFrameInv, 0, sizeof(gBoxFrameInv));
+    memset(gNameFrameInv, 0, sizeof(gNameFrameInv));
+    memset(gNameTextInv, 0, sizeof(gNameTextInv));
+    memset(gDistFrameInv, 0, sizeof(gDistFrameInv));
+    memset(gDistTextInv, 0, sizeof(gDistTextInv));
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
