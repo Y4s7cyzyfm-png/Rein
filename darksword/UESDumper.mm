@@ -575,6 +575,13 @@ static uint64_t gUDNearMissLastV = 0; // 去重：同 V 的全部组合只记一
 static long gUDNearMissJunk = 0;      // 低价值近失计数（字节花纹垃圾，仅汇总）
 static long gUDSkippedBig = 0;        // 值扫描跳过的超大区域数（共享缓存等）
 
+// IDA 实测（2026-09 版）：调试字符串 "TestPrintGUObjectArray" 的映像内偏移
+// 0xBA977EF（vmaddr 0x10BA977EF - IDA 默认基址 0x100000000）。这是开发者
+// 留下的自检打印——引用它的代码必然操作 GUObjectArray。定位路径：
+// __text 里找 ADRP+ADD → 字符串 的交叉引用点，窗口内解码其余 ADRP 目标
+// 直接得到 GUObjectArray（版本漂移时回退 __cstring 搜索字符串新位置）。
+static uint32_t gUDTestPrintStrOff = 0xBA977EF;
+
 static const char *ud_oa_desc(void) {
     static char buf[80];
     char mode[24];
@@ -749,7 +756,9 @@ static int32_t ud_uobject_count(void) {
 #define UD_MAX_SECTS 96
 typedef struct { uint64_t addr, size; char name[32]; } UDSect;
 
-static int ud_collect_data_sections(UDSect *out, int cap) {
+// 收集主映像 Mach-O 的 section（dataOnly=true 只收 __DATA*；false 收全部，
+// 供字符串交叉引用定位查 __TEXT,__cstring / __TEXT,__text）
+static int ud_collect_sections(UDSect *out, int cap, bool dataOnly) {
     uint8_t hdr[32];
     if (!ud_kreadbuf(gBase, hdr, sizeof(hdr))) return 0;
     uint32_t magic = 0;
@@ -806,7 +815,7 @@ static int ud_collect_data_sections(UDSect *out, int cap) {
         if (cmd == 0x19 && csz >= 72) {
             char seg[17];
             memcpy(seg, cmds + off + 8, 16); seg[16] = 0;
-            if (!strncmp(seg, "__DATA", 6)) {
+            if (!dataOnly || !strncmp(seg, "__DATA", 6)) {
                 uint32_t nsects = 0;
                 memcpy(&nsects, cmds + off + 64, 4);
                 uint64_t soff = off + 72;
@@ -1026,7 +1035,7 @@ static bool ud_find_gobjects_by_value(uint32_t gworldIdx, uint64_t gworld,
            (unsigned long long)base, s, o);
 
     UDSect sects[UD_MAX_SECTS];
-    int nSects = ud_collect_data_sections(sects, UD_MAX_SECTS);
+    int nSects = ud_collect_sections(sects, UD_MAX_SECTS, true);
     uint8_t *buf = (uint8_t *)malloc(0x4000);
     uint64_t *hits = (uint64_t *)calloc(8, sizeof(uint64_t));
     if (!buf || !hits || nSects <= 0) { free(buf); free(hits); return false; }
@@ -1095,6 +1104,205 @@ static bool ud_find_gobjects_by_value(uint32_t gworldIdx, uint64_t gworld,
     return false;
 }
 
+// ============================================================
+// 字符串交叉引用定位（第六轮主攻，优先级最高）
+// ============================================================
+// "TestPrintGUObjectArray" 是开发者自检打印——引用它的代码必然操作
+// GUObjectArray。__text 找 ADRP+ADD → 字符串 的引用点，窗口内解码
+// 其余 ADRP 组合（ADD=取全局地址 / LDR=读全局指针）得到候选并强校验。
+
+// ---- arm64 指令解码（ADRP / ADD imm / LDR imm unsigned）----
+static bool ud_decode_adrp(uint32_t insn, uint64_t pc, uint64_t *target, uint32_t *reg) {
+    if ((insn & 0x9F000000) != 0x90000000) return false;
+    int64_t imm = (int64_t)(((insn >> 5) & 0x7FFFF) << 2) | ((insn >> 29) & 0x3);
+    if (imm & 0x100000) imm -= 0x200000; // 符号扩展 21 位
+    *target = (pc & ~0xFFFULL) + ((uint64_t)imm << 12); // ADRP 页大小恒为 4KB
+    *reg = insn & 0x1F;
+    return true;
+}
+
+static bool ud_decode_add_imm(uint32_t insn, uint32_t *rn, uint64_t *imm) {
+    if ((insn & 0x9F000000) != 0x91000000) return false;
+    uint32_t shift = (insn >> 22) & 1;
+    *imm = (uint64_t)((insn >> 10) & 0xFFF) << (shift ? 12 : 0);
+    *rn = (insn >> 5) & 0x1F;
+    return true;
+}
+
+static bool ud_decode_ldr_imm(uint32_t insn, uint32_t *rn, uint64_t *off) {
+    if ((insn & 0xFFC00000) != 0xF9400000) return false;
+    *off = (uint64_t)((insn >> 10) & 0xFFF) * 8;
+    *rn = (insn >> 5) & 0x1F;
+    return true;
+}
+
+// 在 [lo,hi) 代码里找 ADRP+ADD → targetVA 的交叉引用点（页缓冲扫描）
+static int ud_scan_text_for_refs(uint64_t lo, uint64_t hi, uint64_t targetVA,
+                                 uint64_t *hits, int maxHits) {
+    uint8_t *buf = (uint8_t *)malloc(0x4000);
+    if (!buf) return 0;
+    __block int n = 0;
+    vmmapiterateentries(gVMMap, ^(uint64_t start, uint64_t end, uint64_t entry, BOOL *stop) {
+        if (n >= maxHits || end <= lo || start >= hi) return;
+        uint64_t page = start & ~0x3FFFULL;
+        if (page < lo) page = lo & ~0x3FFFULL;
+        for (; page < end && page < hi && n < maxHits; page += 0x4000ULL) {
+            ud_kread_best_effort(page, buf, 0x4000);
+            for (uint64_t o = 0; o + 8 <= 0x4000ULL && n < maxHits; o += 4) {
+                uint32_t i1, i2;
+                memcpy(&i1, buf + o, 4);
+                memcpy(&i2, buf + o + 4, 4);
+                uint64_t tgt; uint32_t rd;
+                if (!ud_decode_adrp(i1, page + o, &tgt, &rd)) continue;
+                uint32_t rn; uint64_t imm;
+                if (!ud_decode_add_imm(i2, &rn, &imm) || rn != rd) continue;
+                if (tgt + imm != targetVA) continue;
+                hits[n++] = page + o;
+            }
+            // 页界跨越的指令对：直接补读下一页首指令
+            if (n < maxHits && (page + 0x4000) < hi) {
+                uint32_t i1, i2 = 0;
+                memcpy(&i1, buf + 0x3FFC, 4);
+                ud_kreadbuf(page + 0x4000, &i2, 4);
+                uint64_t tgt; uint32_t rd;
+                if (ud_decode_adrp(i1, page + 0x3FFC, &tgt, &rd)) {
+                    uint32_t rn; uint64_t imm;
+                    if (ud_decode_add_imm(i2, &rn, &imm) && rn == rd && tgt + imm == targetVA)
+                        hits[n++] = page + 0x3FFC;
+                }
+            }
+        }
+    });
+    free(buf);
+    return n;
+}
+
+// 在 __cstring 里搜字符串（版本漂移兜底；返回 VA，0=未找到）
+static uint64_t ud_search_cstring(uint64_t lo, uint64_t hi, const char *needle) {
+    size_t len = strlen(needle);
+    uint8_t *buf = (uint8_t *)malloc(0x4000);
+    if (!buf) return 0;
+    __block uint64_t found = 0;
+    vmmapiterateentries(gVMMap, ^(uint64_t start, uint64_t end, uint64_t entry, BOOL *stop) {
+        if (found || end <= lo || start >= hi) return;
+        uint64_t page = start & ~0x3FFFULL;
+        if (page < lo) page = lo & ~0x3FFFULL;
+        for (; page < end && page < hi && !found; page += 0x4000ULL) {
+            ud_kread_best_effort(page, buf, 0x4000);
+            for (uint64_t o = 0; o + len < 0x4000ULL; o++) {
+                if (buf[o] != (uint8_t)needle[0]) continue;
+                if (memcmp(buf + o, needle, len) == 0 && buf[o + len] == 0) {
+                    found = page + o;
+                    *stop = YES;
+                    return;
+                }
+            }
+        }
+    });
+    free(buf);
+    return found;
+}
+
+// 引用点周边窗口（±1KB）内提取 ADRP 组合的候选地址：
+//   ADRP+ADD → 全局地址（结构内嵌映像 / 取地址传参）
+//   ADRP+LDR → 全局指针变量（解一次引用得堆上结构）
+// 候选同时按 ±{0,8,0x10,0x18,0x20} 微调——LDR 读字段时 tgt+off 是
+// 字段地址（如 &GUO.ObjObjects），须回退到结构基址再确认。
+static bool ud_find_gobjects_by_stringref(uint32_t gworldIdx, uint64_t gworld,
+                                          uint64_t *foundOut) {
+    static const char *kStr = "TestPrintGUObjectArray";
+    UDSect all[UD_MAX_SECTS];
+    int nAll = ud_collect_sections(all, UD_MAX_SECTS, false);
+    uint64_t cstrLo = 0, cstrHi = 0, textLo = 0, textHi = 0;
+    for (int i = 0; i < nAll; i++) {
+        if (!strcmp(all[i].name, "__TEXT,__cstring")) {
+            cstrLo = all[i].addr; cstrHi = cstrLo + all[i].size;
+        } else if (!strcmp(all[i].name, "__TEXT,__text")) {
+            textLo = all[i].addr; textHi = textLo + all[i].size;
+        }
+    }
+    if (!textLo) { UD_LOG("未找到 __TEXT,__text section，跳过交叉引用定位"); return false; }
+
+    // 1) 字符串 VA：优先 IDA 偏移（校验内容），失效回退 __cstring 搜索
+    uint64_t strVA = 0;
+    char chk[32] = {0};
+    uint64_t guess = gBase + gUDTestPrintStrOff;
+    if (ud_kreadbuf(guess, chk, 24) && memcmp(chk, kStr, 23) == 0) {
+        strVA = guess;
+    } else if (cstrLo) {
+        UD_LOG("IDA 偏移处字符串不符（版本漂移），回退 __cstring 搜索…");
+        strVA = ud_search_cstring(cstrLo, cstrHi, kStr);
+    }
+    if (!strVA) { UD_LOG("未找到 %s 字符串，跳过交叉引用定位", kStr); return false; }
+    UD_LOG("调试字符串 %s @0x%llx（base+0x%llx），扫描 __text 交叉引用…",
+           kStr, (unsigned long long)strVA, (unsigned long long)(strVA - gBase));
+
+    // 2) __text 找引用点
+    uint64_t hits[8];
+    int nHits = ud_scan_text_for_refs(textLo, textHi, strVA, hits, 8);
+    if (!nHits) { UD_LOG("字符串无 ADRP+ADD 代码引用，转值扫描"); return false; }
+    UD_LOG("交叉引用点 %d 个", nHits);
+
+    // 3) 每个引用点周边窗口提取候选并强校验
+    static const uint32_t kAdj[] = { 0, 0x08, 0x10, 0x18, 0x20 };
+    uint8_t buf[0x800];
+    for (int h = 0; h < nHits; h++) {
+        uint64_t P = hits[h];
+        uint64_t lo = P - 0x400;
+        ud_kread_best_effort(lo, buf, sizeof(buf));
+        UD_LOG("引用点 0x%llx（base+0x%llx）：", (unsigned long long)P,
+               (unsigned long long)(P - gBase));
+        for (uint64_t j = 0; j + 0x1C + 4 <= sizeof(buf); j += 4) {
+            uint32_t i1;
+            memcpy(&i1, buf + j, 4);
+            uint64_t tgt; uint32_t rd;
+            if (!ud_decode_adrp(i1, lo + j, &tgt, &rd)) continue;
+            for (int k = 1; k <= 6; k++) {
+                if (j + 4 * (uint64_t)k + 4 > sizeof(buf)) break;
+                uint32_t i2;
+                memcpy(&i2, buf + j + 4 * (uint64_t)k, 4);
+                uint64_t candAddr = 0; // ADRP 组合算出的地址（全局变量地址）
+                bool indirect = false;
+                uint32_t rn; uint64_t imm;
+                if (ud_decode_add_imm(i2, &rn, &imm) && rn == rd) {
+                    candAddr = tgt + imm;
+                } else {
+                    uint64_t off;
+                    if (ud_decode_ldr_imm(i2, &rn, &off) && rn == rd) {
+                        candAddr = tgt + off;
+                        indirect = true;
+                    }
+                }
+                if (!candAddr || candAddr == strVA) continue;
+                if (candAddr < gBase || candAddr >= gBase + 0x20000000ULL) continue;
+
+                // 候选值集合：直接地址（映像内全局）；间接时加上 *candAddr（堆结构）
+                uint64_t vals[2]; int nv = 0;
+                vals[nv++] = candAddr;
+                if (indirect) {
+                    uint64_t p = ud_kread64(candAddr);
+                    if (ud_ptr_wide(p) && p != candAddr) vals[nv++] = p;
+                }
+                for (int v = 0; v < nv; v++) {
+                    for (size_t a = 0; a < sizeof(kAdj) / sizeof(kAdj[0]); a++) {
+                        uint64_t V = vals[v] - kAdj[a];
+                        if (V < gBase || V >= gBase + 0x20000000ULL) continue;
+                        if (ud_gobjects_confirms(V, gworldIdx, gworld)) {
+                            *foundOut = V;
+                            UD_LOG("交叉引用定位命中（引用点+0x%llx，ADRP→0x%llx%s，adj=-0x%x）",
+                                   (unsigned long long)(P - (lo + j)), (unsigned long long)candAddr,
+                                   indirect ? " 间接" : "", kAdj[a]);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    UD_LOG("交叉引用窗口内未确认 GUObjectArray，转值扫描");
+    return false;
+}
+
 static bool ud_find_gobjects(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     if (UE.offGObjects == 0) {
@@ -1121,9 +1329,12 @@ static bool ud_find_gobjects(void) {
     }
 
     // ---- 定位 ----
-    // 第 0 优先：值扫描——堆里直接搜 GWorld 指针所在的数组槽位，反推数组
-    // 基址后回 __DATA 反查全局指针。不依赖 Num/Max 槽位猜测（第四轮主攻）。
+    // 第 0 优先（最高）：调试字符串交叉引用——TestPrintGUObjectArray 的
+    // 引用代码必然操作 GUObjectArray，ADRP 解码直达（IDA 提供字符串偏移）。
     uint64_t found = 0;
+    if (!ud_find_gobjects_by_stringref(gworldIdx, gGWorld, &found)) {
+    // 第 1 优先：值扫描——堆里直接搜 GWorld 指针所在的数组槽位，反推数组
+    // 基址后回 __DATA 反查全局指针。不依赖 Num/Max 槽位猜测。
     if (!ud_find_gobjects_by_value(gworldIdx, gGWorld, &found)) {
         // 第 1 优先：GWorld 全局附近 ±1MB（GUObjectArray/GEngine 通常与其
         // 链接相邻；配合 memo 化确认，2MB 窗口秒级）
@@ -1137,7 +1348,7 @@ static bool ud_find_gobjects(void) {
         // （含 __bss/__common），按「距 GNames / GWorld 全局的最小距离」从近
         // 到远扫；解析失败回退窗口。
         UDSect sects[UD_MAX_SECTS];
-        int nSects = ud_collect_data_sections(sects, UD_MAX_SECTS);
+        int nSects = ud_collect_sections(sects, UD_MAX_SECTS, true);
         if (nSects > 0) {
             UD_LOG("主映像解析到 %d 个 __DATA* section（按距 GNames/GWorld 距离近 → 远）", nSects);
             for (int i = 0; i < nSects && !found; i++) {
@@ -1160,6 +1371,7 @@ static bool ud_find_gobjects(void) {
                                        gworldIdx, gGWorld, &found);
         }
     }
+    } // 字符串交叉引用未命中时才走值扫描/section 扫描
     ud_page_cache_flush(); // 扫描产生大量一次性映射，回收
     if (gUDMapFail > 0) {
         UD_LOG("页映射失败 %ld 次（内核通道不稳时读到全零，可能漏掉真身——建议重跑）",
