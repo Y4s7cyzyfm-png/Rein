@@ -461,9 +461,18 @@ static BOOL pe_inv_arg(uint64_t inv, const void *bytes, size_t size, NSUInteger 
     return gRC.trojanMem != 0;
 }
 
-// 热路径：投递到 SB 主线程执行（同旧 invoke 步骤，单次 remote_msg）
+// 热路径：投递到 SB 主线程执行——waitUntilDone:NO！
+// YES 会让 trojan 线程阻塞等 SB 主线程，主队列积压时一等就是秒级，
+// 触发 RemoteCall 超时失步。NO 投递即返回；主队列 FIFO 保序，
+// newest-wins 语义可接受。
+// （0x401 崩溃的真正根因已在 TaskRop/RemoteCall.m 修复：旧协议每次调用
+// 结束都回复 pc=0x401 让 trojan 线程重 fault「停泊」，异常消息在两次调用
+// 之间落进端口队列、无人在 waitexc 监听；出框时每秒数百次调用，任何一次
+// 投递失败/失步 = SIGBUS = SpringBoard 注销。现改为持有异常模式：返回陷阱
+// 的消息接收后不回复，线程悬停在内核异常等待里，端口保持空，唯一的 fault
+// 只发生在 waitexc 监听窗口内。）
 static BOOL pe_inv_invoke(uint64_t inv) {
-    return pe_perform_main(inv, pe_sel("invoke"), 0, YES);
+    return pe_perform_main(inv, pe_sel("invoke"), 0, NO);
 }
 
 // 工厂方法结果立即 retain，跨 performSelector 轮次保活（DSBridge 经验）
@@ -1338,7 +1347,7 @@ static void pe_box(int i, PE_Rect r, bool v) {
     PESlotState *st = &gBoxSt[i];
     if (!v) {
         if (st->shown) {
-            if (pe_perform_main(bx, pe_sel("setHidden:"), 1, YES)) st->shown = false;
+            if (pe_perform_main(bx, pe_sel("setHidden:"), 1, NO)) st->shown = false;
             else gRemoteFail++;
         }
         return;
@@ -1358,7 +1367,7 @@ static void pe_box(int i, PE_Rect r, bool v) {
         }
     }
     if (!st->shown) {
-        if (pe_perform_main(bx, pe_sel("setHidden:"), 0, YES)) st->shown = true;
+        if (pe_perform_main(bx, pe_sel("setHidden:"), 0, NO)) st->shown = true;
         else gRemoteFail++;
     }
 }
@@ -1371,7 +1380,7 @@ static void pe_lbl(int i, uint64_t lb, const char *text, PE_Rect r, bool v) {
     uint64_t textInv = isName ? gNameTextInv[i] : gDistTextInv[i];
     if (!v || !text || !text[0]) {
         if (st->shown) {
-            if (pe_perform_main(lb, pe_sel("setHidden:"), 1, YES)) st->shown = false;
+            if (pe_perform_main(lb, pe_sel("setHidden:"), 1, NO)) st->shown = false;
             else gRemoteFail++;
         }
         return;
@@ -1402,7 +1411,7 @@ static void pe_lbl(int i, uint64_t lb, const char *text, PE_Rect r, bool v) {
         }
     }
     if (!st->shown) {
-        if (pe_perform_main(lb, pe_sel("setHidden:"), 0, YES)) st->shown = true;
+        if (pe_perform_main(lb, pe_sel("setHidden:"), 0, NO)) st->shown = true;
         else gRemoteFail++;
     }
 }
