@@ -366,6 +366,7 @@ static BOOL pe_invoke_main_result(uint64_t target, uint64_t selector,
         : 0;
     if (!autoreleasePool) return NO;
 
+    __block BOOL bodyOK = NO;
     @try {
         uint64_t signature = remote_msg(gRC, target,
                                         pe_sel("methodSignatureForSelector:"),
@@ -409,15 +410,18 @@ static BOOL pe_invoke_main_result(uint64_t target, uint64_t selector,
             if (!gRC.trojanMem) return NO;
             if (![gRC remoteRead:resultScratch to:result size:(uint64_t)resultSize]) return NO;
         }
+        bodyOK = YES;
         gRemoteFail = 0; // 成功：清零连续失败计数
         return YES;
     } @finally {
-        if (gRC.trojanMem) {
+        // 只在主体成功时 drain——失败路径上 RemoteCall 可能已失步，
+        // 再发 drain 只会让 trojan 线程多一次裸跳 0x401 的机会
+        if (bodyOK && gRC.trojanMem) {
             remote_msg(gRC, autoreleasePool, drainSelector, 0, 0, 0, 0);
         }
     }
     // 失败路径统一计账（@finally 不可 return，这里补记）：
-    // 连续失败 >30 触发帧循环熔断，防止 RemoteCall 失步后打爆 SpringBoard
+    // 连续失败 ≥3 立即熔断——失步后的任何调用都可能崩掉 SpringBoard
     gRemoteFail++;
 }
 
@@ -456,12 +460,20 @@ static BOOL pe_set_rect_main(uint64_t target, const char *selectorName, CGRect v
     return pe_invoke_main_result(target, pe_sel(selectorName), &argument, 1, NULL, 0);
 }
 
-// 远程 NSString：字节常驻 trojanMem 保留页，避免每帧 remote malloc/write/free
+// 远程 NSString：字节常驻 trojanMem 保留页，避免每帧 remote malloc/write/free。
+// 按文本缓存复用、永不远程 release——2026-09-07 真机实锤：高频远程对象
+// 生灭（alloc→setText:→release→dealloc→objc_removeAssociatedObjects）是
+// trojan 线程 0x401 未捕获崩溃的直接路径。距离/名字是有限集合（量化后
+// 有界），泄漏可控且远比崩 SpringBoard 便宜。
 static const uint64_t kPETextScratchOffset = 0x1000;
 static const size_t kPETextScratchCapacity = 0x400;
+static NSMutableDictionary<NSString *, NSNumber *> *gNSStringCache = nil;
 
 static uint64_t pe_nsstring(NSString *value) {
     if (!gRC || !gRC.trojanMem || !value) return 0;
+    NSNumber *cached = gNSStringCache[value];
+    if (cached && gRC.trojanMem) return cached.unsignedLongLongValue;
+
     const char *utf8 = value.UTF8String;
     if (!utf8) return 0;
     size_t length = strlen(utf8) + 1;
@@ -480,6 +492,15 @@ static uint64_t pe_nsstring(NSString *value) {
     if (!string) {
         uint64_t release = pe_sel("release");
         if (release) remote_msg(gRC, object, release, 0, 0, 0, 0);
+        return 0;
+    }
+    // 缓存并额外 retain 一次，抵消 label 后续 setText: 替换时的释放，
+    // 使对象常驻（只增不删，见函数头注释）
+    uint64_t retain = pe_sel("retain");
+    if (retain) remote_msg(gRC, string, retain, 0, 0, 0, 0);
+    if (!gNSStringCache) gNSStringCache = [NSMutableDictionary dictionary];
+    if (gNSStringCache.count < 512) { // 上限保护（极端情况弃缓存，退化为不缓存）
+        gNSStringCache[value] = @(string);
     }
     return string;
 }
@@ -1307,11 +1328,9 @@ static void pe_lbl(int i, uint64_t lb, const char *text, PE_Rect r, bool v) {
     if (!textChanged && !moved) return; // 稳态：零远程调用
     if (textChanged) {
         NSString *ns = [NSString stringWithUTF8String:text];
-        uint64_t rns = pe_nsstring(ns);
+        uint64_t rns = pe_nsstring(ns); // 缓存复用 + 常驻（不在远端 release，防 dealloc 崩 SB）
         if (rns) {
             BOOL ok = pe_perform_main(lb, pe_sel("setText:"), rns, YES);
-            uint64_t release = pe_sel("release");
-            if (release && gRC.trojanMem) remote_msg(gRC, rns, release, 0, 0, 0, 0);
             if (ok && st) snprintf(st->text, sizeof(st->text), "%s", text);
         }
     }
@@ -1401,8 +1420,8 @@ static void peace_esp_tick(void) {
     gVis = vi;
 
     // 熔断：远程调用连续失败说明 RemoteCall 已失步——继续打调用只会让
-    // trojan 线程裸跳 0x401 崩掉 SpringBoard，立即停止 ESP
-    if (gRemoteFail > 30) {
+    // trojan 线程裸跳 0x401 崩掉 SpringBoard，立即停止 ESP（fail-fast）
+    if (gRemoteFail >= 3) {
         PE_LOG_ERROR("远程调用连续失败 %ld 次，RemoteCall 失步——停止 ESP 防止 SpringBoard 崩溃", gRemoteFail);
         gRun = false;
         return;
@@ -1460,6 +1479,7 @@ void PeaceESPStart(void) {
     gCalibFail = 0; gVpSanityFail = 0; gMyPosLogged = false;
     gRemoteFail = 0;
     pe_slot_states_reset();
+    gNSStringCache = nil; // 远程字符串缓存随会话重建（旧地址已失效）
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
