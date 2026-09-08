@@ -632,6 +632,7 @@ enum {
     // 关卡 / Actor 数组（沿用旧值，本次未提供新数据）不动
     O_PERSISTLEVEL = 0xB8, O_ACTORS = 0xA0, O_ACTORCNT = 0xA8,
     O_FNAME = 0x18, // UObject.NamePrivate（FName index，UESDumper 验证）——对象名含类名前缀（UE 默认命名 ClassName_N）
+    O_CLASS = 0x20, // UObject.ClassPrivate（UClass*，UE4 标准布局，紧随 NamePrivate）——类对象 +0x18 即精确类名
 
     // ---- 以下为 2026-09 新增功能偏移（已录入，功能逐步接入） ----
 
@@ -777,6 +778,27 @@ static const char *pe_fname(uint32_t idx) {
     gNameCache[slot].idx = idx;
     memcpy(gNameCache[slot].str, buf, len + 1);
     return gNameCache[slot].str;
+}
+
+// 对象的精确类名：actor+O_CLASS → UClass（也是 UObject）→ +O_FNAME → 类名。
+// 比对象名 strstr 严格得多：对象名 "CharacterMovementComponent_0" 也含
+// "Character"（组件、代理全混进来，坐标与玩家重合 = 框画不到人身上的根因）。
+static const char *pe_class_name(uint64_t actor) {
+    uint64_t cls = kread64(actor + O_CLASS);
+    if (!(cls >= 0x100000000ULL && cls < 0x800000000ULL)) return NULL;
+    return pe_fname(kread32(cls + O_FNAME));
+}
+
+// 真玩家判定：类名精确匹配当前版本（1.38.12 SDK）的玩家 Character 系。
+// 星球跨进程匹配 "PlayerPawn"（旧版）；本版玩家类为 STExtraPlayerCharacter /
+// STExtraBaseCharacter / STExtraCharacter（SDK 实查），训练场人机同为
+// STExtraCharacter 系，一并命中。
+static bool pe_is_player_class(const char *cn) {
+    if (!cn) return false;
+    return strcmp(cn, "STExtraPlayerCharacter") == 0 ||
+           strcmp(cn, "STExtraBaseCharacter") == 0 ||
+           strcmp(cn, "STExtraCharacter") == 0 ||
+           strcmp(cn, "PlayerPawn") == 0;
 }
 
 // ============================================================
@@ -1213,29 +1235,36 @@ static int pe_actors(PE_Enemy *out, int max) {
         return 0;
     }
     int w = 0;
-    // 类名过滤诊断采样（前 3 个 tick：各打一次通过 HP 检查的对象名样本，
-    // 便于核对「真 Pawn 命中的类名」与「被滤掉的假敌人类名」）
+    // 类名过滤诊断采样（前 3 个 tick）：滤掉与保留的对象名/类名都打样本——
+    // 保留样本直接显示「真敌人的类名与坐标」，是校准过滤的终极证据
     static int sNameSampleTick = 0;
-    int sampleLogged = 0, keptByName = 0, filteredByName = 0;
+    int sampleLogged = 0, keptByName = 0, filteredByName = 0, keptLogged = 0;
     bool sampleThisTick = sNameSampleTick < 3;
     if (sampleThisTick) sNameSampleTick++;
     for (int i = 0; i < cnt && w < max; i++) {
         uint64_t a = kread64(arr + (uint64_t)i * 8); if (!a) continue;
         if ((int)kread32(a + O_TEAM) == gMyTeam && gMyTeam != -1) continue;
         float hp; uint32_t hr = kread32(a + O_HP); memcpy(&hp, &hr, 4); if (hp <= 0) continue;
-        // 类名过滤（2026-09-08 根因修复）：对象名含 Pawn/Character 才是真玩家。
-        // HP>0 会放进几十个假敌人（本地代理/UI 对象，距离 0~30m，
-        // 名字是 "initWithUTF8String:" 之类垃圾）——全部投影在屏幕中心，
-        // 即「框都在前方而人在旁边」。GNames 不可用时退回旧行为。
-        const char *objName = pe_fname(kread32(a + O_FNAME));
-        bool isPawn = objName && (strstr(objName, "Pawn") || strstr(objName, "Character"));
+        // 精确类名过滤（2026-09-08）：只认 UClass 链解出的玩家 Character 系
+        // 类名。对象名 strstr("Pawn"/"Character") 会放进组件/代理对象
+        // （名字同样含 Character，坐标与玩家重合）＝框画不到人身上的根因。
+        // GNames 不可用时退回旧行为（HP 过滤）。
+        const char *cn = pe_class_name(a);
         if (gGNamesOK) {
-            if (isPawn) keptByName++;
-            else {
+            if (pe_is_player_class(cn)) {
+                keptByName++;
+                if (sampleThisTick && keptLogged < 8) {
+                    const char *on = pe_fname(kread32(a + O_FNAME));
+                    PE_LOG("保留样本[%d]：类=%s 对象=%s（obj=0x%llx hp=%.0f）",
+                           sNameSampleTick, cn, on ?: "?",
+                           (unsigned long long)a, hp);
+                    keptLogged++;
+                }
+            } else {
                 filteredByName++;
-                if (sampleThisTick && sampleLogged < 6) {
-                    PE_LOG("类名过滤样本[%d]：滤掉 %s（obj=0x%llx hp=%.0f）",
-                           sNameSampleTick, objName ? objName : "(名字解码失败)",
+                if (sampleThisTick && sampleLogged < 8) {
+                    PE_LOG("滤掉样本[%d]：类=%s（obj=0x%llx hp=%.0f）",
+                           sNameSampleTick, cn ?: "(类名解码失败)",
                            (unsigned long long)a, hp);
                     sampleLogged++;
                 }
@@ -1272,7 +1301,11 @@ static int pe_actors(PE_Enemy *out, int max) {
             sCoordSampleLogged++;
         }
         float dx = loc.x - gMyPos.x, dy = loc.y - gMyPos.y, dz = loc.z - gMyPos.z;
-        float dist = sqrtf(dx * dx + dy * dy + dz * dz); if (dist > PE_FAR_CLIP) continue;
+        float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+        // 贴身过滤：真敌人不可能 0~3m 贴脸重叠——历史日志里 0m/1m/2m 全是
+        // 跟玩家重合的本地对象。即使类名过滤失手也在此兜底。
+        if (dist < 300.0f) continue;
+        if (dist > PE_FAR_CLIP) continue;
         PE_Enemy *e = &out[w];
         e->location = loc; e->distance = dist;
         float hmax; uint32_t hmr = kread32(a + O_HPMAX); memcpy(&hmax, &hmr, 4);
@@ -1289,8 +1322,9 @@ static int pe_actors(PE_Enemy *out, int max) {
         w++;
     }
     if (sampleThisTick) {
-        PE_LOG("类名过滤汇总[%d]：保留 %d、滤掉 %d（滤掉的都是假敌人；若真敌人也没了看样本类名）",
-               sNameSampleTick, keptByName, filteredByName);
+        PE_LOG("类名过滤汇总[%d]：保留 %d、滤掉 %d、最终画出 %d"
+               "（保留样本=真敌人类名；若保留 0 看滤掉样本里的玩家类名是什么）",
+               sNameSampleTick, keptByName, filteredByName, w);
     }
     return w;
 }
@@ -1803,7 +1837,7 @@ void PeaceESPStart(void) {
                 return;
             }
 
-            PE_LOG("=== start (build 20260908-n, GNames class filter) ===（Console.app 过滤 subsystem: com.rein.peaceesp）");
+            PE_LOG("=== start (build 20260908-o, exact class-chain filter) ===（Console.app 过滤 subsystem: com.rein.peaceesp）");
             if (!pe_init_game()) {
                 pe_fail(@"游戏初始化失败（vm_map / 基址扫描），详细日志见 Console.app（subsystem: com.rein.peaceesp）。");
                 return;
