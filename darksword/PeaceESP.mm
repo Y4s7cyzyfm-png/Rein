@@ -326,79 +326,6 @@ static uint32_t kread32(uint64_t va) {
 }
 
 // ============================================================
-// GNames 类名解析（布局由 UESDumper 真机验证：GNames 全局 → 块指针数组，
-// 条目 id = (块<<15)|(位置<<1)，名字 C 字符串 @条目+0x0E）
-// 用途：按对象名筛「真玩家 Pawn」——2026-09-08 实锤 HP>0 过滤放进来
-// 几十个假敌人（本地代理/UI 对象，距离 0~30m，名字是垃圾），全部投影在
-// 屏幕中心附近 = 「框都在前方而人在旁边」的根因（星球跨进程方法论）。
-// ============================================================
-static uint64_t gGNames = 0;
-static bool gGNamesOK = false;
-
-#define PE_NAME_CACHE_CAP (1 << 14) // 16384 槽（idx 键开放寻址；首次解码后 0 读）
-typedef struct { uint32_t idx; char str[64]; } PENameSlot;
-static PENameSlot gNameCache[PE_NAME_CACHE_CAP];
-
-static bool pe_gnames_init(void) {
-    gGNamesOK = false;
-    memset(gNameCache, 0, sizeof(gNameCache));
-    gGNames = kread64(gGameBase + O_GNAME);
-    if (!(gGNames >= 0x100000000ULL && gGNames < 0x800000000ULL)) {
-        PE_LOG_ERROR("GNames=0x%llx 无效（O_GNAME=0x%x 可能过期）——类名过滤禁用，退回 HP 过滤",
-                     (unsigned long long)gGNames, O_GNAME);
-        return false;
-    }
-    // 锚点校验：块0/条目0 的名字必须是 "None"（UESDumper 真机验证的布局签名）
-    uint64_t chunk0 = kread64(gGNames);
-    if (!(chunk0 >= 0x100000000ULL && chunk0 < 0x800000000ULL)) {
-        PE_LOG_ERROR("GNames 块0=0x%llx 无效——类名过滤禁用", (unsigned long long)chunk0);
-        return false;
-    }
-    uint64_t entry0 = kread64(chunk0);
-    if (!(entry0 >= 0x100000000ULL && entry0 < 0x800000000ULL)) {
-        PE_LOG_ERROR("GNames 条目0=0x%llx 无效——类名过滤禁用", (unsigned long long)entry0);
-        return false;
-    }
-    char none[8] = {0};
-    if (!kreadbuf(entry0 + 0x0E, none, 5) || strncmp(none, "None", 4) != 0) {
-        PE_LOG_ERROR("GNames 条目0 名字校验失败（%s != None）——类名过滤禁用", none);
-        return false;
-    }
-    gGNamesOK = true;
-    PE_LOG("GNames=0x%llx OK（None 锚点通过，类名过滤启用）", (unsigned long long)gGNames);
-    return true;
-}
-
-// FName index → 对象名（缓存命中零读；失败返回 NULL）
-static const char *pe_fname(uint32_t idx) {
-    if (!gGNamesOK || idx == 0) return NULL;
-    uint32_t mask = PE_NAME_CACHE_CAP - 1;
-    uint32_t slot = (idx * 2654435761u) & mask;
-    if (gNameCache[slot].idx == idx && gNameCache[slot].str[0]) {
-        return gNameCache[slot].str;
-    }
-    // index 编码（UESDumper 确认 mode 1）：块 = idx>>15，位置 = (idx&0x7FFF)>>1
-    uint32_t chunk = idx >> 15;
-    uint32_t pos = (idx & 0x7FFF) >> 1;
-    if (chunk >= 8192) return NULL;
-    uint64_t chunkPtr = kread64(gGNames + (uint64_t)chunk * 8);
-    if (!(chunkPtr >= 0x100000000ULL && chunkPtr < 0x800000000ULL)) return NULL;
-    uint64_t entry = kread64(chunkPtr + (uint64_t)pos * 8);
-    if (!(entry >= 0x100000000ULL && entry < 0x800000000ULL)) return NULL;
-    char buf[64];
-    if (!kreadbuf(entry + 0x0E, buf, sizeof(buf))) return NULL;
-    size_t len = 0;
-    while (len < sizeof(buf) && buf[len] != 0) len++;
-    if (len == 0 || len >= sizeof(buf)) return NULL; // 无 NUL = 错位垃圾
-    for (size_t i = 0; i < len; i++) {
-        if ((unsigned char)buf[i] < 0x20 || (unsigned char)buf[i] > 0x7E) return NULL;
-    }
-    gNameCache[slot].idx = idx;
-    memcpy(gNameCache[slot].str, buf, len + 1);
-    return gNameCache[slot].str;
-}
-
-// ============================================================
 // 远程 ObjC 调用层（移植自 DSBridge：NSInvocation on SB main thread）
 // ============================================================
 
@@ -778,6 +705,79 @@ static int gVpSanityFail = 0;    // POV 合理性连续失败计数（超限重�
 static bool gMyPosLogged = false;
 
 static uint32_t pe_loc_off(void) { return gLocOff ? gLocOff : O_LOC; }
+
+// ============================================================
+// GNames 类名解析（布局由 UESDumper 真机验证：GNames 全局 → 块指针数组，
+// 条目 id = (块<<15)|(位置<<1)，名字 C 字符串 @条目+0x0E）
+// 用途：按对象名筛「真玩家 Pawn」——2026-09-08 实锤 HP>0 过滤放进来
+// 几十个假敌人（本地代理/UI 对象，距离 0~30m，名字是垃圾），全部投影在
+// 屏幕中心附近 = 「框都在前方而人在旁边」的根因（星球跨进程方法论）。
+// ============================================================
+static uint64_t gGNames = 0;
+static bool gGNamesOK = false;
+
+#define PE_NAME_CACHE_CAP (1 << 14) // 16384 槽（idx 键开放寻址；首次解码后 0 读）
+typedef struct { uint32_t idx; char str[64]; } PENameSlot;
+static PENameSlot gNameCache[PE_NAME_CACHE_CAP];
+
+static bool pe_gnames_init(void) {
+    gGNamesOK = false;
+    memset(gNameCache, 0, sizeof(gNameCache));
+    gGNames = kread64(gGameBase + O_GNAME);
+    if (!(gGNames >= 0x100000000ULL && gGNames < 0x800000000ULL)) {
+        PE_LOG_ERROR("GNames=0x%llx 无效（O_GNAME=0x%x 可能过期）——类名过滤禁用，退回 HP 过滤",
+                     (unsigned long long)gGNames, O_GNAME);
+        return false;
+    }
+    // 锚点校验：块0/条目0 的名字必须是 "None"（UESDumper 真机验证的布局签名）
+    uint64_t chunk0 = kread64(gGNames);
+    if (!(chunk0 >= 0x100000000ULL && chunk0 < 0x800000000ULL)) {
+        PE_LOG_ERROR("GNames 块0=0x%llx 无效——类名过滤禁用", (unsigned long long)chunk0);
+        return false;
+    }
+    uint64_t entry0 = kread64(chunk0);
+    if (!(entry0 >= 0x100000000ULL && entry0 < 0x800000000ULL)) {
+        PE_LOG_ERROR("GNames 条目0=0x%llx 无效——类名过滤禁用", (unsigned long long)entry0);
+        return false;
+    }
+    char none[8] = {0};
+    if (!kreadbuf(entry0 + 0x0E, none, 5) || strncmp(none, "None", 4) != 0) {
+        PE_LOG_ERROR("GNames 条目0 名字校验失败（%s != None）——类名过滤禁用", none);
+        return false;
+    }
+    gGNamesOK = true;
+    PE_LOG("GNames=0x%llx OK（None 锚点通过，类名过滤启用）", (unsigned long long)gGNames);
+    return true;
+}
+
+// FName index → 对象名（缓存命中零读；失败返回 NULL）
+static const char *pe_fname(uint32_t idx) {
+    if (!gGNamesOK || idx == 0) return NULL;
+    uint32_t mask = PE_NAME_CACHE_CAP - 1;
+    uint32_t slot = (idx * 2654435761u) & mask;
+    if (gNameCache[slot].idx == idx && gNameCache[slot].str[0]) {
+        return gNameCache[slot].str;
+    }
+    // index 编码（UESDumper 确认 mode 1）：块 = idx>>15，位置 = (idx&0x7FFF)>>1
+    uint32_t chunk = idx >> 15;
+    uint32_t pos = (idx & 0x7FFF) >> 1;
+    if (chunk >= 8192) return NULL;
+    uint64_t chunkPtr = kread64(gGNames + (uint64_t)chunk * 8);
+    if (!(chunkPtr >= 0x100000000ULL && chunkPtr < 0x800000000ULL)) return NULL;
+    uint64_t entry = kread64(chunkPtr + (uint64_t)pos * 8);
+    if (!(entry >= 0x100000000ULL && entry < 0x800000000ULL)) return NULL;
+    char buf[64];
+    if (!kreadbuf(entry + 0x0E, buf, sizeof(buf))) return NULL;
+    size_t len = 0;
+    while (len < sizeof(buf) && buf[len] != 0) len++;
+    if (len == 0 || len >= sizeof(buf)) return NULL; // 无 NUL = 错位垃圾
+    for (size_t i = 0; i < len; i++) {
+        if ((unsigned char)buf[i] < 0x20 || (unsigned char)buf[i] > 0x7E) return NULL;
+    }
+    gNameCache[slot].idx = idx;
+    memcpy(gNameCache[slot].str, buf, len + 1);
+    return gNameCache[slot].str;
+}
 
 // ============================================================
 // 第 1 层：游戏内存
