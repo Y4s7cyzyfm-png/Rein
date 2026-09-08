@@ -1334,7 +1334,14 @@ static int pe_actors(PE_Enemy *out, int max) {
 // ============================================================
 
 // WorldToScreen：UE4 旋转（度）+ FOV 投影
-// forward=(cp·cy, cp·sy, sp)，right=(sy,−cy,0)，up=right×forward（Roll 忽略，一般为 0）
+// forward=(cp·cy, cp·sy, sp)，right=(-sy,cy,0)，up=(-cy·sp,-sy·sp,cp)
+// 2026-09-08 镜像修正：旧 right=(sy,-cy,0) 方向反了。UE4 左手系 yaw=0
+// 面向 +X 时玩家右侧是 +Y（FVector::RightVector=(0,1,0)），yaw 旋转把
+// (1,0,0)→(cy,sy,0)，同理把 (0,1,0)→(-sy,cy,0)。旧值恰为其相反数 →
+// 敌人左右镜像 = 「框跟着屏幕转、永远画不到人身上」（前后/上下一直正确，
+// 唯独水平翻转）的根因。注意：旧代码 up 由错误 right 叉乘得出却碰巧
+// 正确（-r × f = f × r），翻转 right 后 up 必须显式写死，不能再用
+// right×forward。
 static PE_Vec2S w2s(PE_Vec3 w, const PECamera *cam, double sw, double sh) {
     PE_Vec2S r = {0, 0, false};
     float pitch = cam->rot.x * (float)M_PI / 180.0f;
@@ -1342,10 +1349,8 @@ static PE_Vec2S w2s(PE_Vec3 w, const PECamera *cam, double sw, double sh) {
     float cp = cosf(pitch), sp = sinf(pitch), cy = cosf(yaw), sy = sinf(yaw);
 
     float fx = cp * cy, fy = cp * sy, fz = sp;          // forward
-    float rx = sy,     ry = -cy,    rz = 0.0f;          // right
-    float ux = ry * fz - rz * fy;                       // up = right × forward
-    float uy = rz * fx - rx * fz;
-    float uz = rx * fy - ry * fx;
+    float rx = -sy,    ry = cy,     rz = 0.0f;          // right（修正：(-sinθ,cosθ,0)）
+    float ux = -cy * sp, uy = -sy * sp, uz = cp;        // up（显式展开，勿用 right×forward）
 
     float dx = w.x - cam->loc.x, dy = w.y - cam->loc.y, dz = w.z - cam->loc.z;
     float xf = dx * fx + dy * fy + dz * fz;             // 前向距离
@@ -1691,12 +1696,22 @@ static void peace_esp_tick(void) {
             cam.loc.y + cosf(pr) * sinf(ya) * 500.0f,
             cam.loc.z + sinf(pr) * 500.0f,
         };
+        // 右前方向点（forward·500 + right·400，right=(-sy,cy,0)）：
+        // 必须投影在右半屏——right 向量镜像 bug 的直接探针（旧 bug 时
+        // 它落在左半屏，而前方点自检永远发现不了）
+        PE_Vec3 rightPt = {
+            cam.loc.x + cosf(pr) * cosf(ya) * 500.0f - sinf(ya) * 400.0f,
+            cam.loc.y + cosf(pr) * sinf(ya) * 500.0f + cosf(ya) * 400.0f,
+            cam.loc.z + sinf(pr) * 500.0f,
+        };
         PE_Vec2S fwd = w2s(fwdPt, &cam, gSW, gSH);
+        PE_Vec2S rgt = w2s(rightPt, &cam, gSW, gSH);
         PE_Vec2S selfPt = w2s(gMyPos, &cam, gSW, gSH);
-        PE_LOG("投影自检：中心=(%.0f,%.0f) 前方点->(%.0f,%.0f)%@ 自身->(%.0f,%.0f)%@"
-               "（前方点须≈中心；自身应在中下方——偏差方向告诉我即可修）",
+        PE_LOG("投影自检：中心=(%.0f,%.0f) 前方点->(%.0f,%.0f)%@ 右前点->(%.0f,%.0f)%@ 自身->(%.0f,%.0f)%@"
+               "（前方点须≈中心；右前点须在右半屏，否则 right 仍镜像；自身应在中下方）",
                gSW * 0.5, gSH * 0.5,
                fwd.x, fwd.y, fwd.visible ? @"" : @"(不可见)",
+               rgt.x, rgt.y, rgt.visible ? @"" : @"(不可见)",
                selfPt.x, selfPt.y, selfPt.visible ? @"" : @"(不可见)");
     }
     int w2sVisible = 0;
@@ -1837,7 +1852,7 @@ void PeaceESPStart(void) {
                 return;
             }
 
-            PE_LOG("=== start (build 20260908-o, exact class-chain filter) ===（Console.app 过滤 subsystem: com.rein.peaceesp）");
+            PE_LOG("=== start (build 20260908-p, w2s right-vector mirror fix) ===（Console.app 过滤 subsystem: com.rein.peaceesp）");
             if (!pe_init_game()) {
                 pe_fail(@"游戏初始化失败（vm_map / 基址扫描），详细日志见 Console.app（subsystem: com.rein.peaceesp）。");
                 return;
