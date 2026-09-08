@@ -326,6 +326,79 @@ static uint32_t kread32(uint64_t va) {
 }
 
 // ============================================================
+// GNames 类名解析（布局由 UESDumper 真机验证：GNames 全局 → 块指针数组，
+// 条目 id = (块<<15)|(位置<<1)，名字 C 字符串 @条目+0x0E）
+// 用途：按对象名筛「真玩家 Pawn」——2026-09-08 实锤 HP>0 过滤放进来
+// 几十个假敌人（本地代理/UI 对象，距离 0~30m，名字是垃圾），全部投影在
+// 屏幕中心附近 = 「框都在前方而人在旁边」的根因（星球跨进程方法论）。
+// ============================================================
+static uint64_t gGNames = 0;
+static bool gGNamesOK = false;
+
+#define PE_NAME_CACHE_CAP (1 << 14) // 16384 槽（idx 键开放寻址；首次解码后 0 读）
+typedef struct { uint32_t idx; char str[64]; } PENameSlot;
+static PENameSlot gNameCache[PE_NAME_CACHE_CAP];
+
+static bool pe_gnames_init(void) {
+    gGNamesOK = false;
+    memset(gNameCache, 0, sizeof(gNameCache));
+    gGNames = kread64(gGameBase + O_GNAME);
+    if (!(gGNames >= 0x100000000ULL && gGNames < 0x800000000ULL)) {
+        PE_LOG_ERROR("GNames=0x%llx 无效（O_GNAME=0x%x 可能过期）——类名过滤禁用，退回 HP 过滤",
+                     (unsigned long long)gGNames, O_GNAME);
+        return false;
+    }
+    // 锚点校验：块0/条目0 的名字必须是 "None"（UESDumper 真机验证的布局签名）
+    uint64_t chunk0 = kread64(gGNames);
+    if (!(chunk0 >= 0x100000000ULL && chunk0 < 0x800000000ULL)) {
+        PE_LOG_ERROR("GNames 块0=0x%llx 无效——类名过滤禁用", (unsigned long long)chunk0);
+        return false;
+    }
+    uint64_t entry0 = kread64(chunk0);
+    if (!(entry0 >= 0x100000000ULL && entry0 < 0x800000000ULL)) {
+        PE_LOG_ERROR("GNames 条目0=0x%llx 无效——类名过滤禁用", (unsigned long long)entry0);
+        return false;
+    }
+    char none[8] = {0};
+    if (!kreadbuf(entry0 + 0x0E, none, 5) || strncmp(none, "None", 4) != 0) {
+        PE_LOG_ERROR("GNames 条目0 名字校验失败（%s != None）——类名过滤禁用", none);
+        return false;
+    }
+    gGNamesOK = true;
+    PE_LOG("GNames=0x%llx OK（None 锚点通过，类名过滤启用）", (unsigned long long)gGNames);
+    return true;
+}
+
+// FName index → 对象名（缓存命中零读；失败返回 NULL）
+static const char *pe_fname(uint32_t idx) {
+    if (!gGNamesOK || idx == 0) return NULL;
+    uint32_t mask = PE_NAME_CACHE_CAP - 1;
+    uint32_t slot = (idx * 2654435761u) & mask;
+    if (gNameCache[slot].idx == idx && gNameCache[slot].str[0]) {
+        return gNameCache[slot].str;
+    }
+    // index 编码（UESDumper 确认 mode 1）：块 = idx>>15，位置 = (idx&0x7FFF)>>1
+    uint32_t chunk = idx >> 15;
+    uint32_t pos = (idx & 0x7FFF) >> 1;
+    if (chunk >= 8192) return NULL;
+    uint64_t chunkPtr = kread64(gGNames + (uint64_t)chunk * 8);
+    if (!(chunkPtr >= 0x100000000ULL && chunkPtr < 0x800000000ULL)) return NULL;
+    uint64_t entry = kread64(chunkPtr + (uint64_t)pos * 8);
+    if (!(entry >= 0x100000000ULL && entry < 0x800000000ULL)) return NULL;
+    char buf[64];
+    if (!kreadbuf(entry + 0x0E, buf, sizeof(buf))) return NULL;
+    size_t len = 0;
+    while (len < sizeof(buf) && buf[len] != 0) len++;
+    if (len == 0 || len >= sizeof(buf)) return NULL; // 无 NUL = 错位垃圾
+    for (size_t i = 0; i < len; i++) {
+        if ((unsigned char)buf[i] < 0x20 || (unsigned char)buf[i] > 0x7E) return NULL;
+    }
+    gNameCache[slot].idx = idx;
+    memcpy(gNameCache[slot].str, buf, len + 1);
+    return gNameCache[slot].str;
+}
+
+// ============================================================
 // 远程 ObjC 调用层（移植自 DSBridge：NSInvocation on SB main thread）
 // ============================================================
 
@@ -631,6 +704,7 @@ enum {
 
     // 关卡 / Actor 数组（沿用旧值，本次未提供新数据）不动
     O_PERSISTLEVEL = 0xB8, O_ACTORS = 0xA0, O_ACTORCNT = 0xA8,
+    O_FNAME = 0x18, // UObject.NamePrivate（FName index，UESDumper 验证）——对象名含类名前缀（UE 默认命名 ClassName_N）
 
     // ---- 以下为 2026-09 新增功能偏移（已录入，功能逐步接入） ----
 
@@ -854,7 +928,9 @@ static bool pe_init_game(void)
     if (!gGameOK) {
         PE_LOG_ERROR("GWorld=0x%llx 不在预期范围，ESP 可能无数据——游戏版本偏移可能需要更新",
                      (unsigned long long)gworld);
+        return false; // GWorld 都不对，GNames 大概率也不对，别带病运行
     }
+    pe_gnames_init(); // 失败不致命：退回 HP 过滤（会混入假敌人，但日志有提示）
     return true;
 }
 
@@ -1137,10 +1213,35 @@ static int pe_actors(PE_Enemy *out, int max) {
         return 0;
     }
     int w = 0;
+    // 类名过滤诊断采样（前 3 个 tick：各打一次通过 HP 检查的对象名样本，
+    // 便于核对「真 Pawn 命中的类名」与「被滤掉的假敌人类名」）
+    static int sNameSampleTick = 0;
+    int sampleLogged = 0, keptByName = 0, filteredByName = 0;
+    bool sampleThisTick = sNameSampleTick < 3;
+    if (sampleThisTick) sNameSampleTick++;
     for (int i = 0; i < cnt && w < max; i++) {
         uint64_t a = kread64(arr + (uint64_t)i * 8); if (!a) continue;
         if ((int)kread32(a + O_TEAM) == gMyTeam && gMyTeam != -1) continue;
         float hp; uint32_t hr = kread32(a + O_HP); memcpy(&hp, &hr, 4); if (hp <= 0) continue;
+        // 类名过滤（2026-09-08 根因修复）：对象名含 Pawn/Character 才是真玩家。
+        // HP>0 会放进几十个假敌人（本地代理/UI 对象，距离 0~30m，
+        // 名字是 "initWithUTF8String:" 之类垃圾）——全部投影在屏幕中心，
+        // 即「框都在前方而人在旁边」。GNames 不可用时退回旧行为。
+        const char *objName = pe_fname(kread32(a + O_FNAME));
+        bool isPawn = objName && (strstr(objName, "Pawn") || strstr(objName, "Character"));
+        if (gGNamesOK) {
+            if (isPawn) keptByName++;
+            else {
+                filteredByName++;
+                if (sampleThisTick && sampleLogged < 6) {
+                    PE_LOG("类名过滤样本[%d]：滤掉 %s（obj=0x%llx hp=%.0f）",
+                           sNameSampleTick, objName ? objName : "(名字解码失败)",
+                           (unsigned long long)a, hp);
+                    sampleLogged++;
+                }
+                continue;
+            }
+        }
         uint64_t rc = kread64(a + O_ROOTCOMP);
         if (rc < 0x100000000ULL || rc >= 0x800000000ULL) {
             if (gFailActors < 3) {
@@ -1186,6 +1287,10 @@ static int pe_actors(PE_Enemy *out, int max) {
         e->bottom = loc; e->bottom.z -= 88.0f;
         e->top = loc;    e->top.z += 87.0f;
         w++;
+    }
+    if (sampleThisTick) {
+        PE_LOG("类名过滤汇总[%d]：保留 %d、滤掉 %d（滤掉的都是假敌人；若真敌人也没了看样本类名）",
+               sNameSampleTick, keptByName, filteredByName);
     }
     return w;
 }
@@ -1698,7 +1803,7 @@ void PeaceESPStart(void) {
                 return;
             }
 
-            PE_LOG("=== start (build 20260908-m, probe indirect + call lock) ===（Console.app 过滤 subsystem: com.rein.peaceesp）");
+            PE_LOG("=== start (build 20260908-n, GNames class filter) ===（Console.app 过滤 subsystem: com.rein.peaceesp）");
             if (!pe_init_game()) {
                 pe_fail(@"游戏初始化失败（vm_map / 基址扫描），详细日志见 Console.app（subsystem: com.rein.peaceesp）。");
                 return;
