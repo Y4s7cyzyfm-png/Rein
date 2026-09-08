@@ -1698,7 +1698,7 @@ void PeaceESPStart(void) {
                 return;
             }
 
-            PE_LOG("=== start (build 20260907-l, probe fix + capsule z + w2s diag) ===（Console.app 过滤 subsystem: com.rein.peaceesp）");
+            PE_LOG("=== start (build 20260908-m, probe indirect + call lock) ===（Console.app 过滤 subsystem: com.rein.peaceesp）");
             if (!pe_init_game()) {
                 pe_fail(@"游戏初始化失败（vm_map / 基址扫描），详细日志见 Console.app（subsystem: com.rein.peaceesp）。");
                 return;
